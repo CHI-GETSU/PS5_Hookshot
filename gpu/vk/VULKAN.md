@@ -1,5 +1,14 @@
 # The Vulkan back end (mkw_vk.dll)
 
+> This is the back end's development log from mkw-recomp, kept for its reasons and not updated since. Names and
+> defaults have moved: the DLL is `hookshot_vk.dll` (`hookshot_vk.so` on Linux) and the default renderer, with
+> `RX_BACKEND` only to pick another; the image and upload code of `vk_image.cpp` and `vk_upload.cpp` is in
+> `vk_texture.cpp`; a draw whose pipeline is not ready waits with `RX_VK_PIPE_SKIP=0` (there is no `RX_VK_PIPE_WAIT`);
+> `RX_VK_DUMP` takes a present number and writes PNGs; `RX_VK_FRAMEGEN` only turns frame generation off (the Insert
+> menu turns it on); the texture budget `RX_VK_VRAM_MB` defaults to 70% of what the driver allows (at most 6 GB),
+> `RX_VK_TEX_MAX_MB` to 1536 and `RX_VK_MIRROR_MB` to a share of the card; and `eden/` carries Hookshot's changes.
+> The current switches are in [docs/development.md](../../docs/development.md#switches-for-testing-and-debugging).
+
 `RX_BACKEND=vulkan` renders through `mkw_vk.dll` instead of the WebGPU renderer in the executable
 (`gpu/render`). `host/rx_backend.c` owns the `rx_*` names the host calls. It loads the DLL, passes it the host
 functions (`vk_api.h` `MkwVkHost`) and routes the calls to the table the DLL returns (`MkwVkRenderer`). If the DLL

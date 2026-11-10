@@ -37,7 +37,7 @@ int upscaler() { return up_now; }
 #include "gpu/vk/upscaler_rows.h"
 using namespace mkwvk;
 namespace ur = upscaler_rows;
-''' + host[host.index("static int ini_option("):host.index("HLE(_ZN2nn2oe16GetOperationModeEv)")] + menu[
+''' + host[host.index("int hos_ini_option(const char *key, int otherwise);"):host.index("HLE(_ZN2nn2oe16GetOperationModeEv)")] + menu[
         menu.index("struct Out {"):menu.index("/// The Render resolution: the value chosen")] + menu[
         menu.index("const char* tx_output_res("):menu.index("const char* tx_speed(")] + r'''
 int main(int argc, char **argv) {
@@ -46,14 +46,15 @@ int main(int argc, char **argv) {
     const unsigned w = atoi(argv[2]), h = atoi(argv[3]);
     assert(output_mode() == mode);
     assert(hos_output_size(0) == w && hos_output_size(1) == h);
-    assert(hos_rt_pool_size(305ull << 20) == ((mode == 2 ? 687ull : 512ull) << 20));   // (512 MB at least: nn_applet.c)
-    assert(kLastOutput == 3);
-    assert(output_choice(-1) == 0 && output_choice(4) == 0);
+    assert(hos_rt_pool_size(305ull << 20) == ((mode == 2 ? 687ull : mode == 4 ? 610ull : 512ull) << 20));   // (512 MB at least: nn_applet.c)
+    assert(kLastOutput == 4);
+    assert(output_choice(-1) == 0 && output_choice(4) == 4 && output_choice(5) == 0);
     assert(step_output_choice(3, -1) == 3);
     assert(step_output_choice(3, 1) == 0 && step_output_choice(0, -1) == 3);
     assert(step_output_choice(0, 1) == 1 && step_output_choice(1, -1) == 0);
     assert(step_output_choice(1, 1) == 2 && step_output_choice(2, -1) == 1);
-    assert(step_output_choice(2, 1) == 2);
+    assert(step_output_choice(2, 1) == 4);
+    assert(step_output_choice(4, -1) == 2 && step_output_choice(4, 1) == 4);
     opts.output_res = mode;
     opts.handheld = handheld();
     assert(strcmp(tx_output_res(mode), argv[4]) == 0);
@@ -83,7 +84,9 @@ int main(int argc, char **argv) {
         (3, 0, None, 3, 1920, 1080, "1920x1080"),
         (1, 0, "3", 3, 1920, 1080, "1920x1080"),
         (3, 1, "3", 0, 2560, 1440, "2048x1152 (game's)"),
-        (4, 0, None, 0, 2560, 1440, "2048x1152 (game's)"),
+        (4, 1, None, 0, 2560, 1440, "2048x1152 (game's)"),
+        (5, 0, None, 0, 2560, 1440, "2048x1152 (game's)"),
+        (4, 0, None, 4, 5120, 1440, "5120x1440"),
     )
     with tempfile.TemporaryDirectory(prefix="output-resolution-") as tmp:
         work = Path(tmp)
@@ -98,7 +101,7 @@ int main(int argc, char **argv) {
             if override is not None:
                 env["HOS_OUTPUT_RES"] = override
             subprocess.run([str(exe), str(mode), str(w), str(h), label], cwd=work, env=env, check=True)
-    print("PASS: output sizes, menu order, 1080p override, handheld, render-target budgets and DLSS sizes at 1080p")
+    print("PASS: output sizes, menu order, 1080p override, handheld, render-target budgets and DLSS sizes at 1080p, and 5120x1440")
 
 
 if __name__ == "__main__":

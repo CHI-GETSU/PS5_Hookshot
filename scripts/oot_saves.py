@@ -293,6 +293,14 @@ def refuse_links(path):
 
 
 def copy_saves(src, dst, backup, keep_settings, dry_run):
+    target_path = os.path.normcase(os.path.realpath(dst))
+    backup_path = os.path.normcase(os.path.realpath(backup))
+    try:
+        inside_target = os.path.commonpath((target_path, backup_path)) == target_path
+    except ValueError:
+        inside_target = False  # Windows paths can be on different drives.
+    if inside_target:
+        raise Fail("choose a --backup-dir outside the target save folder (%s)" % dst)
     names = slots(src)
     if not names:
         raise Fail("%s has no slot_* folders: nothing to copy" % src)

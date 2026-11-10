@@ -27,6 +27,13 @@ class SdlAudioLibraryTests(unittest.TestCase):
         self.assertIn("hos_sdl_audio_open(", fn)
         self.assertNotIn("LoadLibraryA", fn)
 
+    def test_audio_device_buffer_matches_audio_frame_quantum(self):
+        text = SDL.read_text(encoding="utf-8")
+        start = text.index("int hos_sdl_audio_open(")
+        fn = text[start:text.index("\n}", start)]
+        self.assertIn('"SDL_AUDIO_DEVICE_SAMPLE_FRAMES", "480"', fn)
+        self.assertIn('getenv("SDL_AUDIO_DEVICE_SAMPLE_FRAMES")', fn)
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main(verbosity=1))

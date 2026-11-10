@@ -25,6 +25,10 @@ void TranslatorVisitor::MEMBAR(u64 inst) {
         BitField<8, 2, LocalScope> scope;
     } const membar{inst};
 
+    if ((inst >> 20) & 1) {   // (hookshot: bit 20, which Maxwell leaves zero, set only by the Ampere lowering: a subgroup barrier)
+        ir.SubgroupBarrier();
+        return;
+    }
     if (membar.scope == LocalScope::CTA) {
         ir.WorkgroupMemoryBarrier();
     } else {

@@ -45,6 +45,7 @@ struct Program {
     VkPipeline compute_pipeline = VK_NULL_HANDLE;
     // (the compute pipeline's build: 0 not started, 1 on a worker, 2 done (compute_pipeline made, or failed): vk_draw.cpp dispatch)
     std::atomic<int> compute_state{0};
+    mutable std::atomic<bool> dispatched{false};   // (hookshot) noted in hookshot_computes.bin (vk_draw.cpp compute_note)
     bool push = false;             // its set is pushed (VK_KHR_push_descriptor)
     VkShaderStageFlags push_stages = 0;
     bool uses_render_area = false;
@@ -92,6 +93,7 @@ size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const
                                bool computes = true);   // (computes: and every kept compute program)
 /// The precompile of every shader of the game (hookshot_shaders.bin, from nx2/shader_census.py): how many programs it names, 0: none
 size_t seed_open();
+std::string seed_path();   // (hookshot_shaders.bin, beside the game)
 void seed_close();
 /// Program i of the seed, translated and kept for the default state (null: kept already, or it does not translate); its modules are yours
 std::unique_ptr<Program> seed_program(size_t i, int inputs = 0);

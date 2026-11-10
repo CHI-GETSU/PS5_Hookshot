@@ -6,7 +6,9 @@ each frame. Until it has run the mouse's motion is the right stick's (hos_mouse_
 pitch by 0.1 degrees a count at sensitivity 1, pitch kept within the limits and yaw wrapped at 180, up and down swapped
 with the menu's Invert mouse vertical (option 8), and the controller reads leave the motion to the camera. Without the
 menu's Mouse camera (option 6), or on an object that is not a camera, it does nothing; 150 ms without the camera (the
-pause menu, another camera) give the motion back to the stick.
+pause menu, another camera) give the motion back to the stick. The camera takes the mouse only in its states 3 and 4 (at
++0x204: following Link, turned by the player): aiming in first person leaves it updating with state 0 while another
+camera draws, and the motion is then the stick's.
 python -I -B tests/test_mouse_native.py   (Linux: host/posix's windows.h)
 """
 import shutil
@@ -57,6 +59,7 @@ static void putf(uint64_t a, float f) { memcpy(GP(a), &f, 4); }
 static int fails;
 #define PITCH (CAM + 0x18c)
 #define YAW (CAM + 0x1a4)
+static void state(uint32_t v) { memcpy(GP(CAM + 0x204), &v, 4); }
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s (pitch %g yaw %g)\n", __LINE__, #c, getf(PITCH), getf(YAW)); fails++; } } while (0)
 static int near(float a, float b) { return fabsf(a - b) < 1e-3f; }
 static void frame(int32_t dx, int32_t dy) { move_x += dx, move_y += dy; clock_ns += 16666667; hos_mouse_camera(CAM); }
@@ -64,6 +67,7 @@ int main(void) {
     fake_heap = (uint8_t *)calloc(64, 4096);
     putf(CAM + 0x178, -85), putf(CAM + 0x17c, 89);
     putf(PITCH, 10), putf(YAW, 30);
+    state(4);   /* turned by the player */
     move_x = 5, move_y = 3;
     CHECK(hos_mouse_native() == -1);   /* no camera has run yet: the stick takes it */
     move_x = move_y = 0;
@@ -101,6 +105,19 @@ int main(void) {
     captured = 1;
     clock_ns += 200000000LL;   /* no camera for 200 ms (the pause menu): the stick again */
     CHECK(hos_mouse_native() == -1);
+    /* aiming in first person (the slingshot): the camera keeps updating, state 0, another draws: the stick takes it */
+    state(4);
+    frame(0, 0);   /* the camera's a moment ago (the hook ran: hos_mouse_native would give 1 for 150 ms) */
+    state(0);
+    putf(YAW, 0);
+    frame(10, 0);
+    CHECK(near(getf(YAW), 0.0f) && move_x == 10);
+    CHECK(hos_mouse_native() == -1);   /* at once, not 150 ms later */
+    move_x = 0;
+    state(3);   /* following Link again: the mouse turns it */
+    frame(10, 0);
+    CHECK(near(getf(YAW), -1.0f));
+    CHECK(hos_mouse_native() == 1);
     if (!fails) printf("PASS\n");
     return fails != 0;
 }

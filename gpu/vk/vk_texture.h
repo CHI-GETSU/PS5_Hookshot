@@ -182,6 +182,18 @@ uint64_t texture_bytes();
 void full_barrier(VkCommandBuffer cmd, const char* why = "barrier (other)");
 /// Full barriers recorded and left out (RX_VK_BARRIER_DEDUPE_OFF=1: none), since the start
 void barrier_stats(int64_t* made, int64_t* left_out);
+/// (hookshot) Set around a draw's sampled-texture lookups (vk_draw.cpp): a new ASTC texture there may wait for a later frame
+/// once this frame's uploads passed their budget (texture_touch). Never for compute: a dispatch may bake what it reads once
+extern thread_local bool upload_defer_ok;
+/// A draw pass just ended on cmd (end_pass): pass_start_barrier knows nothing else ran after it
+void note_pass_end(VkCommandBuffer cmd);
+/// The barrier a draw pass starts with. Full, unless RX_VK_PASS_BARRIER=game and the last thing on cmd was a draw pass with no
+/// barrier of the game's after it: then the new pass waits for the earlier work in its fragment stages only, so its vertex work
+/// may overlap the previous pass's fragments (NVN asks for a barrier before rendering results are read; only vertex-stage
+/// reads of the previous pass's output with no barrier from the game can change order)
+void pass_start_barrier(VkCommandBuffer cmd);
+/// Pass starts with the fragment-stage barrier, since the start
+int64_t pass_barriers_relaxed();
 void texture_stats(int64_t* uploads, int64_t* astc_gpu, int64_t* bytes_uploaded);
 /// (hookshot) whether texture_read_texels' walk of r at that row stride (0: the region's own) and its own image stride
 /// stays within avail bytes of the data it is given (overflow-checked: the stride is the game's)

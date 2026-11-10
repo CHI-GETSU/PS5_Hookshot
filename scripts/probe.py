@@ -46,9 +46,17 @@ def key_rows(rows):
 
 
 frames = collections.OrderedDict()
-for line in open(sys.argv[1]):
-    r = line.split()
-    frames.setdefault(r[0], []).append(r)
+with open(sys.argv[1], encoding="utf-8") as capture:
+    for line_number, line in enumerate(capture, 1):
+        r = line.split()
+        if not r:
+            continue
+        if len(r) < 11:
+            raise SystemExit(f"Probe capture line {line_number} is incomplete. Capture a new probe_*.txt file.")
+        frames.setdefault(r[0], []).append(r)
+if len(frames) != 3:
+    raise SystemExit(f"Probe capture expected 3 frames, found {len(frames)}. "
+                     "Capture a new probe_*.txt file with the frame before, the flash, and the frame after.")
 a, b, c = [key_rows(v) for v in frames.values()]
 ratio = float(sys.argv[2]) if len(sys.argv) > 2 else 4.0
 lines = int(sys.argv[3]) if len(sys.argv) > 3 else 25

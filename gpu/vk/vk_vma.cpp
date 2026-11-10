@@ -232,6 +232,10 @@ bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free) {
             // (the free space in VMA's blocks: the driver counts it as the process's, new allocations take it first)
             f += b[h].statistics.blockBytes - std::min(b[h].statistics.blockBytes, b[h].statistics.allocationBytes);
         }
+    // (a test: RX_VK_TEST_ALLOWED_MB=<n> reports what the driver allows as at most n MB, so a 16 GB card plays the eviction and
+    // keep-rendered paths an 8 GB card takes when its VRAM fills (the rainbow textures of issue 993 were never seen here otherwise))
+    static const uint64_t test_allowed = getenv("RX_VK_TEST_ALLOWED_MB") ? (uint64_t)atoi(getenv("RX_VK_TEST_ALLOWED_MB")) << 20 : 0;
+    if (test_allowed && t > test_allowed) t = test_allowed;
     *used = u, *budget = t;
     if (block_free) *block_free = f;
     return t != 0;

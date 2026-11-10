@@ -56,7 +56,7 @@ jobs:
         run: python -m pip install --disable-pip-version-check --no-deps zstandard==0.25.0
       - name: Compilers and the SPIR-V validator
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y g++ clang spirv-tools
+        run: sudo apt-get update && sudo apt-get install -y g++ clang spirv-tools glslang-tools
 
       # (the steps below all run when one before them failed, so one run shows every failure)
       - name: Check Windows native source regressions

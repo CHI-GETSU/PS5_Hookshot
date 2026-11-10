@@ -399,9 +399,16 @@ Staging staging(uint64_t n, uint64_t align = 256) {
     Arena a;
     a.size = std::max(kArena, uint64_t((n + 0xFFFFF) & ~0xFFFFFull));
     void* m = nullptr;
+    const auto t_make = std::chrono::steady_clock::now();
     if (!create_buffer(a.size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, a.buffer,
                        a.allocation, &m) || !m)
         return {};
+    {   // (hookshot: what making a staging arena costs the replay thread: on a card with resizable BAR it is VRAM the driver hands
+        // out, and a scene change made several right after the idle ones were freed)
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_make).count();
+        static int slow_logged;
+        if (ms > 5 && slow_logged++ < 24) logf("vk: a staging arena of %llu MB took %.1f ms to make", (unsigned long long)(a.size >> 20), ms);
+    }
     a.mapped = (uint8_t*)m;
     a.value = rec_value, a.used = n;
     a.used_at = std::chrono::steady_clock::now();
@@ -1209,7 +1216,62 @@ uint32_t gpu_owned_since(uint64_t gpu, uint64_t n) {
     return covered >= n && since != UINT32_MAX ? std::max(since, 1u) : 0;
 }
 
+// (hookshot, smoothness) What a frame's uploads cost by the way they went: when a frame's uploads take over 50 ms (the stutters at
+// area loads and in walking, 180-360 ms frames of 250-450 MB: Discord and the frame trace, 2026-11-09), one log line of the routes
+// (ASTC on the GPU, unswizzled on the GPU, on the CPU), their count, MB and ms, and the slowest textures
+enum UpRoute { UP_ASTC, UP_GPU, UP_CPU, UP_COUNT };
+thread_local int up_route = UP_CPU;
+struct UpStat { int64_t n = 0, bytes = 0, ns = 0; };
+UpStat up_frame[UP_COUNT];
+struct UpSlow { int64_t ns; uint32_t w, h, layers, nvn; int route; uint64_t bytes; };
+std::vector<UpSlow> up_slowest;
+std::mutex up_mu;   // (uploads may come from a parallel replay's threads)
+std::atomic<int64_t> frame_upload_ns{0};   // (this frame's time in upload(), every thread's)
+std::atomic<int64_t> st_deferred{0}, st_deferred_frame{0};
+void upload_frame_report() {
+    std::lock_guard lk(up_mu);
+    int64_t ns = 0;
+    for (const UpStat& u : up_frame) ns += u.ns;
+    static int logged;
+    if (ns >= 50000000 && logged < 300) {
+        logged++;
+        static const char* names[UP_COUNT] = {"ASTC on the GPU", "unswizzled on the GPU", "on the CPU"};
+        char line[900];
+        int k = snprintf(line, sizeof line, "vk: a frame's uploads took %.0f ms:", ns / 1e6);
+        for (int r = 0; r < UP_COUNT; r++)
+            if (up_frame[r].n)
+                k += snprintf(line + k, sizeof line - k, " %s %lld (%.1f MB, %.0f ms);", names[r], (long long)up_frame[r].n,
+                              up_frame[r].bytes / 1048576.0, up_frame[r].ns / 1e6);
+        std::sort(up_slowest.begin(), up_slowest.end(), [](const UpSlow& a, const UpSlow& b) { return a.ns > b.ns; });
+        for (size_t i = 0; i < up_slowest.size() && i < 3 && k < (int)sizeof line - 80; i++)
+            k += snprintf(line + k, sizeof line - k, " [%ux%u x%u NVN %#x %s %.1f MB %.0f ms]", up_slowest[i].w, up_slowest[i].h,
+                          up_slowest[i].layers, up_slowest[i].nvn, names[up_slowest[i].route], up_slowest[i].bytes / 1048576.0,
+                          up_slowest[i].ns / 1e6);
+        logf("%s", line);
+    }
+    for (UpStat& u : up_frame) u = {};
+    up_slowest.clear();
+}
+bool upload_inner(Texture& tex, const Ranges* dirty);
 bool upload(Texture& tex, const Ranges* dirty) {
+    const auto t0 = std::chrono::steady_clock::now();
+    up_route = UP_CPU;
+    const bool ok = upload_inner(tex, dirty);
+    const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    frame_upload_ns.fetch_add(ns, std::memory_order_relaxed);
+    std::lock_guard lk(up_mu);
+    UpStat& u = up_frame[up_route];
+    u.n++, u.bytes += (int64_t)tex.guest_size, u.ns += ns;
+    if (ns > 2000000) {
+        up_slowest.push_back({ns, tex.width, tex.height, tex.layers, tex.nvn_format, up_route, tex.guest_size});
+        if (up_slowest.size() > 64) {
+            std::sort(up_slowest.begin(), up_slowest.end(), [](const UpSlow& a, const UpSlow& b) { return a.ns > b.ns; });
+            up_slowest.resize(8);
+        }
+    }
+    return ok;
+}
+bool upload_inner(Texture& tex, const Ranges* dirty) {
     PROF(PROF_UPLOAD);
     if (!tex.gpu || tex.samples != VK_SAMPLE_COUNT_1_BIT) return false;
     const uint64_t total = tex.guest_size;
@@ -1233,10 +1295,12 @@ bool upload(Texture& tex, const Ranges* dirty) {
                  (unsigned long long)tex.first_seen);
         }
     }
-    if (tex.astc && upload_astc_gpu(tex, total, dirty)) return true;
+    if (tex.astc && (up_route = UP_ASTC, upload_astc_gpu(tex, total, dirty))) return true;
+    up_route = UP_CPU;
     if (tex.bc) return false;   // (no CPU path into BC3)
     // (the GPU's unswizzle reads guest memory as it is: not where the capture kept the storage as it was at its submit)
-    if (!(tex.gpu < (1ull << 40) && memory_has_shadow(tex.gpu, total)) && upload_unswizzle_gpu(tex, total, dirty)) return true;
+    if (!(tex.gpu < (1ull << 40) && memory_has_shadow(tex.gpu, total)) && upload_unswizzle_gpu(tex, total, dirty))
+        return up_route = UP_GPU, true;
     const bool linear = nvn_tex_is_linear(&tex.d);
     int widen_from = 0;
     widened(tex.d.format ? vk_format(tex.nvn_format).format : tex.format, &widen_from);
@@ -1741,7 +1805,10 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         // (asked without STORAGE: AMD's driver checks that against the compressed format and says no, though it makes
         // the image and its raw views (RX 6600 XT, amdvlk); without them the game's BC encoders wrote nowhere and
         // Link's clothes showed stale blocks. If the image is then refused, it is made again without)
-        if ((format_props(raw).optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) &&
+        // (RX_VK_BC_STORAGE=0: compressed images without it, as before v2.0.8 on AMD: issue 1278, an RX 6700 XT's GPU time 6-12 ms
+        // a frame on v2.0.6 and 60-100 ms on v2.0.11, the game's BC encoders running there since 04675cf being the lead)
+        static const bool bc_storage = !getenv("RX_VK_BC_STORAGE") || atoi(getenv("RX_VK_BC_STORAGE")) != 0;
+        if (bc_storage && (format_props(raw).optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) &&
             vkGetPhysicalDeviceImageFormatProperties(dev.physical, x.format, x.type, VK_IMAGE_TILING_OPTIMAL,
                 x.usage, flags, &limits) == VK_SUCCESS)
             x.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
@@ -1963,8 +2030,47 @@ void full_barrier(VkCommandBuffer cmd, const char* why) {
     last_barrier_cmd = cmd, last_barrier_epoch = work_epoch.load(std::memory_order_relaxed);
 }
 
+namespace {
+thread_local VkCommandBuffer last_pass_end_cmd = VK_NULL_HANDLE;   // (the command buffer this thread's last draw pass ended on, and the work count then)
+thread_local uint64_t last_pass_end_epoch = 0;
+std::atomic<int64_t> st_pass_relaxed{0};
+} // namespace
+void note_pass_end(VkCommandBuffer cmd) {
+    last_pass_end_cmd = cmd, last_pass_end_epoch = work_epoch.load(std::memory_order_relaxed);
+}
+int64_t pass_barriers_relaxed() { return st_pass_relaxed.load(std::memory_order_relaxed); }
+void pass_start_barrier(VkCommandBuffer cmd) {
+    static const bool game = [] {
+        const char* e = getenv("RX_VK_PASS_BARRIER");
+        const bool on = e && !strcmp(e, "game");
+        if (on) logf("vk: RX_VK_PASS_BARRIER=game: a draw pass right after another, no barrier of the game's between, waits in its fragment stages only");
+        return on;
+    }();
+    if (!game || par_active.load(std::memory_order_relaxed) || cmd != last_pass_end_cmd ||
+        work_epoch.load(std::memory_order_relaxed) != last_pass_end_epoch) {
+        full_barrier(cmd, "barrier (pass start)");
+        return;
+    }
+    // (the previous pass's writes, all stages, made visible to this pass's fragment-side stages; its vertex, task and mesh stages run
+    // as soon as they can, as on the console's GPU)
+    st_pass_relaxed.fetch_add(1, std::memory_order_relaxed);
+    GprofSpan gp(cmd, "barrier (pass start, fragments)");
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                     VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1;
+    d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
+    last_barrier_cmd = VK_NULL_HANDLE;   // (not a full one: the next full barrier is not left out after it)
+}
+
 void texture_begin_recording(VkCommandBuffer upload, uint64_t value) {
-    last_barrier_cmd = VK_NULL_HANDLE;   // (a new recording: its command buffers start afresh, whatever their handles held)
+    last_barrier_cmd = VK_NULL_HANDLE;
+    last_pass_end_cmd = VK_NULL_HANDLE;   // (a new recording: its command buffers start afresh, whatever their handles held)
     up_cmd = upload;
     if (value != rec_value) epoch++;   // (a submission's parts check a texture's memory once: nothing is collected between)
     rec_value = value;
@@ -2052,10 +2158,28 @@ uint32_t texture_epoch() {
     return epoch;
 }
 
+thread_local bool upload_defer_ok = false;
+namespace {
+/// (hookshot) A new ASTC texture a draw samples, met after this frame's uploads took their budget: not uploaded now, the draw
+/// samples the placeholder, and the next frame's first look at it uploads it. An area's load made 300-800 ASTC uploads in one
+/// frame, 200-600 ms of the replay thread (the "a frame's uploads took" lines); now that is spread over several frames, the
+/// textures coming in a few frames late. ASTC only: those are the materials' colour, normal and mask textures; uncompressed
+/// ones can be data (height maps, look-up tables) that a frame without would get wrong. RX_VK_UPLOAD_BUDGET_MS=<n>: the
+/// budget (40: only an area load's burst; at 8 the ground's streamed textures waited a frame in ordinary play and the ground
+/// flickered, Discord 2026-11-09), 0: no deferral, as before
+bool upload_defer(const Texture& tex) {
+    static const int64_t budget_ns = (int64_t)(getenv("RX_VK_UPLOAD_BUDGET_MS") ? atof(getenv("RX_VK_UPLOAD_BUDGET_MS")) : 40.0) * 1000000;
+    if (!budget_ns || !upload_defer_ok || tex.uploaded || !tex.astc || tex.gpu_written) return false;
+    if (frame_upload_ns.load(std::memory_order_relaxed) < budget_ns) return false;
+    st_deferred.fetch_add(1, std::memory_order_relaxed), st_deferred_frame.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+}  // namespace
 Texture* texture_touch(Texture* tex, bool for_sampling) {
     tex->last_frame = frame_no;
     tex->last_value = rec_value;
     if (!for_sampling) return tex;
+    if (upload_defer(*tex)) return nullptr;
     // contents: from guest memory unless the GPU wrote the image (then it is the content, unless the texture was
     // finalized since and the CPU writes its memory again). What the CPU writes into it after the GPU's write is taken
     // all the same, those ranges alone, the rest staying the GPU's: Eden's texture cache takes a CPU write over the
@@ -3094,6 +3218,17 @@ Texture* texture_for_present(const nvn_tex* t) {
 }
 
 void texture_frame(uint64_t completed) {
+    upload_frame_report();
+    frame_upload_ns.store(0, std::memory_order_relaxed);
+    if (const int64_t d = st_deferred_frame.exchange(0, std::memory_order_relaxed)) {
+        // (the views and descriptor sets resolved to the placeholder this frame go stale, as when textures go: the next frame
+        // looks those textures up again, and uploads them)
+        destroy_gen++;
+        static int told;
+        if (told++ < 40 || st_deferred.load(std::memory_order_relaxed) % 2000 < d)
+            logf("vk: %lld new ASTC textures left for a later frame (this frame's uploads took their budget; %lld so far)", (long long)d,
+                 (long long)st_deferred.load(std::memory_order_relaxed));
+    }
     completed_value = completed;
     frame_no++;
     {   // (staging arenas the GPU is done with, beyond 256 MB of them, and any over 64 MB: freed. A scene change stages
@@ -3188,9 +3323,13 @@ void texture_frame(uint64_t completed) {
     const bool known = vram_usage(&used, &allowed, &block_free);
     if (!own)   // (RX_VK_VRAM_MB, else 70% of what the driver allows the process at the first look)
         own = getenv("RX_VK_VRAM_MB") ? (uint64_t)atoi(getenv("RX_VK_VRAM_MB")) << 20
-              : known                ? std::min<uint64_t>(allowed / 10 * 7, 6144ull << 20)   // (hookshot: at most 6 GB. A 16 GB
-                                                                                             // card's 10.8 GB filled up, read as a leak: 105, 106)
+              : known                ? std::min<uint64_t>(allowed / 100 * (allowed <= (8704ull << 20) ? 45 : 70), 6144ull << 20)
                                      : 4096ull << 20;
+    // (hookshot: at most 6 GB: a 16 GB card's 10.8 GB filled up, read as a leak: 105, 106. On a card of 8 GB or less, 45% of what the
+    // driver allows, not 70%: the game's other VRAM (render targets, the pools' mirrors and imports, buffers, pipelines) is ~3.5-3.8 GB
+    // in Hyrule Field, so 70% (5.1 GB of an 8 GB card's 7.3) put the whole past what the card holds. The driver paged VRAM to system
+    // memory and the GPU time went from ~13 to 55 ms a frame for good: an RTX 3060 Ti at 14 fps ten seconds into play, #1400's
+    // RTX 4050 at 5 fps. RX_VK_VRAM_MB=<MB>: the old size, or any)
     {   // (hookshot) an integrated GPU's "VRAM" is the system's RAM, which the game's own ~10 GB also needs: 70% of what the driver allows
         // was 5.3 GB of textures on a 16 GB laptop with a Radeon 780M, and the PC ran out of memory in Hyrule Field within minutes
         // (Discord, 2026-11-09). At most 2.5 GB there unless RX_VK_VRAM_MB says otherwise
@@ -3455,9 +3594,9 @@ void texture_frame(uint64_t completed) {
         // past the write-back's size, ...): its image is the only copy, and one made again over that storage is not uploaded (the
         // memory counts as the GPU's), so it showed whatever its new memory held: the rainbow/garbled textures that spread over play
         // time on 4-8 GB cards (issue 993)? Up to 256 MB of such textures each stay; bigger ones (a whole area left behind) go as
-        // before. OPT-IN (RX_VK_KEEP_UNFLUSHABLE=1) until a tester confirms it helps: a forced-eviction test here could not show it
-        // (the texture that came back empty there was one the game had finalized), and keeping them costs VRAM on small cards.
-        static const bool evict_unflushable = getenv("RX_VK_KEEP_UNFLUSHABLE") == nullptr;
+        // before. On by default since 2026-11-09 (8 GB RTX 3070s still showed rainbow textures once VRAM filled, Discord): the VRAM it
+        // costs is bounded (256 MB a texture) and a wrong texture is worse than a fuller budget. RX_VK_EVICT_UNFLUSHABLE=1: evicted, as before
+        static const bool evict_unflushable = getenv("RX_VK_EVICT_UNFLUSHABLE") && atoi(getenv("RX_VK_EVICT_UNFLUSHABLE")) != 0;
         if (!overwritten && tex->gpu_written && !tex->released && !evict_unflushable && tex->bytes < (256ull << 20) && !flushable(*tex)) {
             static std::atomic<int> kept_logged{0};
             if (kept_logged.fetch_add(1) < 40)

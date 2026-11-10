@@ -42,6 +42,7 @@ struct Reflex {
     PFN_vkSetLatencyMarkerNV marker = nullptr;
     PFN_vkGetLatencyTimingsNV timings = nullptr;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    uint64_t swapchain_generation = 0;   // (a sleep may finish after this chain was replaced)
     VkSemaphore wake = VK_NULL_HANDLE;   // (timeline: the sleep's end)
     uint64_t wake_value = 0;
     uint64_t id = 1;                     // (the frame's present id)
@@ -60,7 +61,7 @@ int wanted_mode() {
     return std::clamp(e && *e ? atoi(e) : opts.reflex, 0, 2);
 }
 
-/// Usable now: the row on, the extension and its feature, a swapchain made with latency mode, and no frame generation (its
+/// With r.mu held: the row on, the extension and its feature, a swapchain made with latency mode, and no frame generation (its
 /// own display thread)
 bool on() {
     Reflex& r = rx();
@@ -169,6 +170,7 @@ void reflex_swapchain_info(VkSwapchainCreateInfoKHR& ci) {
 
 bool reflex_swapchain_stale() {
     Reflex& r = rx();
+    std::lock_guard lk(r.mu);
     return r.ready && r.swapchain && r.latency != (wanted_mode() > 0);
 }
 
@@ -177,59 +179,72 @@ void reflex_swapchain_created(VkSwapchainKHR swapchain) {
     if (!r.ready) return;
     std::lock_guard lk(r.mu);
     const bool was = r.latency;
+    ++r.swapchain_generation;
     r.swapchain = swapchain, r.mode = -1, r.frame_marked = false, r.latency = r.latency_next;
     if (r.latency) apply_mode();
     else if (was) logf("vk: NVIDIA Reflex: off");
 }
 
-void reflex_present_begins() {
-    if (!on()) return;
+void reflex_swapchain_destroyed() {
     Reflex& r = rx();
     std::lock_guard lk(r.mu);
-    if (!r.frame_marked) return;
+    ++r.swapchain_generation;
+    r.swapchain = VK_NULL_HANDLE;
+    r.latency = false;
+    r.frame_marked = false;
+    r.mode = -1;
+}
+
+void reflex_present_begins() {
+    Reflex& r = rx();
+    std::lock_guard lk(r.mu);
+    if (!on() || !r.frame_marked) return;
     mark(VK_LATENCY_MARKER_SIMULATION_END_NV);
     mark(VK_LATENCY_MARKER_RENDERSUBMIT_START_NV);
 }
 
 void reflex_submit_ends() {
-    if (!on()) return;
     Reflex& r = rx();
     std::lock_guard lk(r.mu);
+    if (!on()) return;
     if (r.frame_marked) mark(VK_LATENCY_MARKER_RENDERSUBMIT_END_NV);
 }
 
 const void* reflex_present_id(const void* next) {
-    if (!on()) return next;
     Reflex& r = rx();
     std::lock_guard lk(r.mu);
-    if (!r.frame_marked) return next;
+    if (!on() || !r.frame_marked) return next;
     mark(VK_LATENCY_MARKER_PRESENT_START_NV);
     r.pid.pNext = next, r.pid.swapchainCount = 1, r.pid.pPresentIds = &r.id;
     return &r.pid;
 }
 
 void reflex_presented() {
-    if (!on()) return;
     Reflex& r = rx();
     std::lock_guard lk(r.mu);
+    if (!on()) return;
     if (r.frame_marked) mark(VK_LATENCY_MARKER_PRESENT_END_NV);
 }
 
 void reflex_sleep() {
-    if (!on()) return;
     Reflex& r = rx();
+    uint64_t generation, value;
     {
         std::lock_guard lk(r.mu);
+        if (!on()) return;
+        generation = r.swapchain_generation;
         apply_mode();   // (the menu's row may have changed)
         if (r.frame_marked) log_timings(), r.id++;
         VkLatencySleepInfoNV s{VK_STRUCTURE_TYPE_LATENCY_SLEEP_INFO_NV};
         s.signalSemaphore = r.wake, s.value = ++r.wake_value;
+        value = s.value;
         if (r.sleep(dev.device, r.swapchain, &s) != VK_SUCCESS) return;
     }
     VkSemaphoreWaitInfo w{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
-    w.semaphoreCount = 1, w.pSemaphores = &r.wake, w.pValues = &r.wake_value;
+    w.semaphoreCount = 1, w.pSemaphores = &r.wake, w.pValues = &value;
     vkWaitSemaphores(dev.device, &w, 100000000ull);   // (100 ms at most: a driver that never wakes it does not stop the game)
     std::lock_guard lk(r.mu);
+    if (!on() || generation != r.swapchain_generation || value != r.wake_value) return;
     mark(VK_LATENCY_MARKER_SIMULATION_START_NV);
     mark(VK_LATENCY_MARKER_INPUT_SAMPLE_NV);
     r.frame_marked = true;

@@ -44,7 +44,7 @@ def main():
                  block(scale_source, "VkImage framegen_scale("))
     template = (ROOT / "tests/upscale_independent_test.cpp").read_text(encoding="utf-8")
     assert template.count("// PRODUCTION_FUNCTIONS") == 1
-    fixture = template.replace("// PRODUCTION_FUNCTIONS", functions)
+    fixture = template.replace("// PRODUCTION_FUNCTIONS", block(source, "void drop_pipe(") + "\n" + functions)
     with tempfile.TemporaryDirectory(prefix="upscale-independent-") as tmp:
         owned = Path(tmp).resolve()
         assert owned.parent == Path(tempfile.gettempdir()).resolve() and owned.name.startswith("upscale-independent-")

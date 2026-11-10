@@ -85,7 +85,7 @@ python -I scripts\oot_saves.py export nx2navi --hookshot "C:\Games\Hookshot"
 | `--profile <id>` | The emulator's profile to use. Needed when more than one profile has saves: the script lists them and stops rather than pick one |
 | `--from <folder>`, `--to <folder>` | The emulator's side: the save folder itself, or a folder above it to search (a data folder, a portable `user` folder, NX2navi's game folder). With a name, it replaces where that emulator is looked for; without one, any folder works |
 | `--hookshot <folder>` | Hookshot's data folder (Windows: the game folder), or its `save\<user id>` folder |
-| `--backup-dir <folder>` | Where the backup goes |
+| `--backup-dir <folder>` | Where the backup goes, outside the target save folder |
 | `--force` | Copies even if a game seems to be running, or NX2navi has a save waiting |
 
 The script refuses to run while it sees Hookshot or any of the programs above running. The side being overwritten is

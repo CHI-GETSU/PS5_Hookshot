@@ -217,7 +217,17 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
             ctx.OpReturn();
             break;
         case IR::AbstractSyntaxNode::Type::Unreachable:
-            ctx.OpUnreachable();
+            if (ctx.stage == Stage::Mesh && !ctx.mesh_fallback) {
+                // (hookshot) an indirect branch to none of its table's targets: the mesh shader leaves with no outputs.
+                // RADV makes OpUnreachable a return that leaves its output counts undefined, and GS_ALLOC_REQ then asked
+                // for a garbage count and hung the GPU (issue 1000). Marker for OpSetMeshOutputsEXT 0 0
+                // (PatchMeshInstructions); the epilogue writes the outputs, so none were written yet
+                ctx.OpStore(ctx.u32_zero_value, ctx.u32_zero_value);
+                ctx.mesh_zero_outputs_marker = true;
+                ctx.OpReturn();
+            } else {
+                ctx.OpUnreachable();
+            }
             break;
         }
         if (node.type != IR::AbstractSyntaxNode::Type::Block) {
@@ -618,7 +628,8 @@ void RewriteOpcodes(std::vector<u32>& code, std::span<const std::pair<u32, spv::
 void PatchMeshInstructions(std::vector<u32>& code, const EmitContext& ctx) {
     const bool set_outputs{Sirit::ValidId(ctx.mesh_outputs_marker[0])};
     const bool emit_tasks{Sirit::ValidId(ctx.mesh_tasks_marker[0])};
-    if (!set_outputs && !emit_tasks) {
+    const bool zero_outputs{ctx.mesh_zero_outputs_marker};
+    if (!set_outputs && !emit_tasks && !zero_outputs) {
         return;
     }
     const auto store_at = [&](size_t offset, Id pointer, Id object) {
@@ -636,6 +647,9 @@ void PatchMeshInstructions(std::vector<u32>& code, const EmitContext& ctx) {
         }
         if (set_outputs &&
             store_at(offset, ctx.mesh_outputs_marker[0], ctx.mesh_outputs_marker[1])) {
+            code[offset] = (3U << 16) | static_cast<u32>(spv::Op::OpSetMeshOutputsEXT);
+            patched = true;
+        } else if (zero_outputs && store_at(offset, ctx.u32_zero_value, ctx.u32_zero_value)) {
             code[offset] = (3U << 16) | static_cast<u32>(spv::Op::OpSetMeshOutputsEXT);
             patched = true;
         } else if (emit_tasks && store_at(offset, tasks[0], tasks[1]) &&

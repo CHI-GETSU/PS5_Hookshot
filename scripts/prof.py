@@ -7,7 +7,9 @@ module+offset frames, leaf first. Frames in hookshot_vk.dll / hookshot.exe are n
 
 Prints the functions by inclusive share (in the stack at all) and by self share (the leaf), and the leaf modules.
 """
-import bisect, collections, itertools, os, re, sys
+import bisect, collections, itertools, os, re, stat, sys
+from contextlib import ExitStack
+from tempfile import TemporaryFile
 
 BUILD = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "work", "sa", "build")
 
@@ -35,10 +37,19 @@ def demangle(n):
 
 def profile_lines(path, skip):
     """Keep the old line-based slice without holding the capture in memory."""
-    with open(path, encoding="utf-8", errors="replace") as f:
+    with open(path, encoding="utf-8", errors="replace") as f, ExitStack() as files:
         start = 0
         if skip:
-            count = sum(1 for _ in f)
+            # Windows can report a pipe as seekable, even though it cannot be replayed.
+            if stat.S_ISREG(os.fstat(f.fileno()).st_mode) and f.seekable():
+                count = sum(1 for _ in f)
+            else:
+                # A pipe can only be read once. Save its lines on disk to keep memory bounded.
+                spool = files.enter_context(TemporaryFile(mode="w+t", encoding="utf-8", newline="\n"))
+                count = 0
+                for count, line in enumerate(f, 1):
+                    spool.write(line)
+                f = spool
             start = int(count * skip)
             if start < 0:
                 start = max(0, count + start)

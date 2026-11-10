@@ -415,6 +415,7 @@ public:
     std::vector<MeshDefault> mesh_vertex_defaults;
     std::vector<MeshLineTarget> mesh_primitive_targets;
     std::array<Id, 2> mesh_outputs_marker{};
+    bool mesh_zero_outputs_marker{};   ///< (hookshot) OpStore(zero, zero): OpSetMeshOutputsEXT 0 0 where a branch has no target
     std::array<Id, 4> mesh_tasks_marker{};
 
     // (hookshot) a GPU without VK_EXT_mesh_shader: Task and Mesh are compute shaders. Their stage buffer outputs go to

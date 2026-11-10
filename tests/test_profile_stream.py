@@ -2,6 +2,7 @@
 import contextlib
 import importlib.util
 import io
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -14,7 +15,7 @@ prof = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(prof)
 
 
-class IteratedFile(io.StringIO):
+class IteratedFile(io.TextIOWrapper):
     """A profile may be iterated, but must not be materialized as one string or list."""
     def read(self, *args):
         raise AssertionError("read must not load the profile")
@@ -28,7 +29,9 @@ class ProfileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="hookshot-profile-") as folder:
             if maps:
                 Path(folder, "hookshot.map").write_text(maps, encoding="utf-8")
-            profile = IteratedFile(text)
+            source = Path(folder, "stacks.txt")
+            source.write_text(text, encoding="utf-8")
+            profile = IteratedFile(source.open("rb"), encoding="utf-8")
             real_open = open
 
             def open_input(path, *args, **kwargs):
@@ -64,6 +67,18 @@ class ProfileTests(unittest.TestCase):
     def test_empty_input(self):
         for skip in ("0", "0.5"):
             self.assertEqual(self.capture("", skip), "0 samples\n-- leaf modules\n-- inclusive\n-- self\n")
+
+    def test_skip_on_a_pipe_preserves_physical_line_positions(self):
+        for skip, expected in ((0, ["a.dll+1\n", "\n", "b.dll+2\n", "c.dll+3"]),
+                               (0.5, ["b.dll+2\n", "c.dll+3"]), (-0.25, ["c.dll+3"])):
+            with self.subTest(skip=skip):
+                reader, writer = os.pipe()
+                with os.fdopen(reader, encoding="utf-8") as profile:
+                    with os.fdopen(writer, "wb") as output:
+                        output.write(b"a.dll+1\r\n\r\nb.dll+2\r\nc.dll+3")
+                    with mock.patch.object(profile, "seekable", return_value=True), \
+                            mock.patch.object(prof, "open", return_value=profile, create=True):
+                        self.assertEqual(list(prof.profile_lines("synthetic-pipe", skip)), expected)
 
     def test_symbol_resolution_and_filter(self):
         maps = " 0001:00000000 ?draw@renderer@@ 0000000140000010 f\n"

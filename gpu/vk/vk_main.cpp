@@ -124,6 +124,10 @@ bool create_instance() {
         std::vector<VkExtensionProperties> all(n);
         vkEnumerateInstanceExtensionProperties(nullptr, &n, all.data());
         dlss_instance_extensions(ext_list, all);
+        // (hookshot) the HDR10 colour space for the Insert menu's HDR (the menu's settings are read after the instance is made, so
+        // whenever the driver has it; the SDR choice in create_swapchain keeps to the sRGB surface)
+        if (has_extension(all, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))
+            ext_list.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME), dev.swapchain_colorspace = true;
     }
     ci.enabledExtensionCount = (uint32_t)ext_list.size();
     ci.ppEnabledExtensionNames = ext_list.data();
@@ -478,6 +482,25 @@ bool create_swapchain(uint32_t width, uint32_t height) {
         if ((f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) &&
             f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
             fmt = f;
+    // (hookshot) the Insert menu's HDR: a 10-bit HDR10 surface when the display lists one (Windows: "Use HDR" on in its display
+    // settings), the picture then written by framegen_hdr. Otherwise the SDR one above, said once
+    dev.hdr = false;
+    if (opts.hdr) {
+        for (const auto& f : formats)
+            if ((f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32) &&
+                f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT)
+                fmt = f, dev.hdr = true;
+        static bool told;
+        if (!told) {
+            told = true;
+            if (dev.hdr)
+                logf("vk: HDR: an HDR10 surface (format %d), paper white %d nits, peak %d nits", (int)fmt.format, opts.hdr_white,
+                     opts.hdr_peak);
+            else
+                logf("vk: HDR: the display lists no HDR10 surface%s: SDR",
+                     dev.swapchain_colorspace ? " (is HDR on in the display settings?)" : " (no VK_EXT_swapchain_colorspace)");
+        }
+    }
     // mailbox when the driver has it (latest frame, no tear). The game paces itself (nn_vi.c).
     n = 0;
     result = vkGetPhysicalDeviceSurfacePresentModesKHR(dev.physical, dev.surface, &n, nullptr);
@@ -537,6 +560,16 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     reflex_swapchain_info(ci);   // (NVIDIA Reflex: latency mode on)
     VkSwapchainKHR sc;
     result = vkCreateSwapchainKHR(dev.device, &ci, nullptr, &sc);
+    // Passing oldSwapchain retires it even when creation fails. Nothing may acquire from it again.
+    if (dev.swapchain) {
+        device_wait_idle_locked();   // (the present queue's presents of the old swapchain done too)
+        reflex_swapchain_destroyed();   // (no latency sleep or markers may use the destroyed chain)
+        for (auto semaphore : dev.swap_rendered) vkDestroySemaphore(dev.device, semaphore, nullptr);
+        vkDestroySwapchainKHR(dev.device, dev.swapchain, nullptr);
+        dev.swapchain = VK_NULL_HANDLE;
+        dev.swap_rendered.clear();
+        dev.swap_images.clear();
+    }
     if (result != VK_SUCCESS) {
         logf("vk: vkCreateSwapchainKHR failed (VkResult %d, extent %ux%u, format %d, usage %#x, mode %d, images %u)",
              (int)result, width, height, (int)fmt.format, ci.imageUsage, (int)mode, ci.minImageCount);
@@ -546,6 +579,12 @@ bool create_swapchain(uint32_t width, uint32_t height) {
         vkDestroySwapchainKHR(dev.device, sc, nullptr);
         return false;
     }
+    std::vector<VkImage> images(n);
+    if (vkGetSwapchainImagesKHR(dev.device, sc, &n, images.data()) != VK_SUCCESS || !n) {
+        vkDestroySwapchainKHR(dev.device, sc, nullptr);
+        return false;
+    }
+    images.resize(n);
     std::vector<VkSemaphore> rendered(n, VK_NULL_HANDLE);
     VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     for (auto& semaphore : rendered) {
@@ -556,18 +595,11 @@ bool create_swapchain(uint32_t width, uint32_t height) {
             return false;
         }
     }
-    if (dev.swapchain) {
-        device_wait_idle_locked();   // (the present queue's presents of the old swapchain done too)
-        for (auto semaphore : dev.swap_rendered) vkDestroySemaphore(dev.device, semaphore, nullptr);
-        vkDestroySwapchainKHR(dev.device, dev.swapchain, nullptr);
-    }
     dev.swapchain = sc;
     dev.swap_rendered = std::move(rendered);
     dev.swap_format = fmt.format;
     dev.swap_extent = {width, height};
-    vkGetSwapchainImagesKHR(dev.device, sc, &n, nullptr);
-    dev.swap_images.resize(n);
-    vkGetSwapchainImagesKHR(dev.device, sc, &n, dev.swap_images.data());
+    dev.swap_images = std::move(images);
     logf("vk: swapchain %ux%u, %u images, %s", width, height, n,
          mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo");
     reflex_swapchain_created(sc);   // (NVIDIA Reflex: its sleep mode on the new swapchain)

@@ -164,7 +164,7 @@ def gpu_sources():
 def tree_headers(*roots, skip=()):
     """Every header under these folders, as one dependency blob (suyu's headers sit in many folders); folders named
     in skip are left out"""
-    h = hashlib.sha1()
+    h = hashlib.sha1(usedforsecurity=False)
     for root in roots:
         found = []
         # (the walk pruned as it goes: sorting the whole walk first, as this once did, made skip do nothing, and every
@@ -302,16 +302,61 @@ def tree_rss(pid):
     return n
 
 
+class ProcessEntry(ctypes.Structure):   # (Windows' PROCESSENTRY32W, for CreateToolhelp32Snapshot)
+    _fields_ = [("size", ctypes.c_uint32), ("usage", ctypes.c_uint32), ("pid", ctypes.c_uint32), ("heap", ctypes.c_size_t),
+                ("module", ctypes.c_uint32), ("threads", ctypes.c_uint32), ("parent", ctypes.c_uint32), ("base", ctypes.c_long),
+                ("flags", ctypes.c_uint32), ("exe", ctypes.c_wchar * 260)]
+
+
+def tree_ws(pid):
+    """(windows) The working set in bytes of a process and the processes it started: llvm-mingw's clang.exe is a 5 MB driver, and the
+    memory is in the clang-23.exe it runs"""
+    k = ctypes.WinDLL("kernel32")
+    psapi = ctypes.WinDLL("psapi")
+    k.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    k.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    k.Process32FirstW.argtypes = k.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessEntry)]
+    k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    k.OpenProcess.restype = ctypes.c_void_p
+    k.CloseHandle.argtypes = [ctypes.c_void_p]
+    psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessMemory), ctypes.c_uint32]
+    snapshot = k.CreateToolhelp32Snapshot(2, 0)   # (TH32CS_SNAPPROCESS)
+    if snapshot in (None, ctypes.c_void_p(-1).value):
+        return 0
+    children = {}
+    try:
+        e = ProcessEntry()
+        e.size = ctypes.sizeof(ProcessEntry)
+        more = k.Process32FirstW(snapshot, ctypes.byref(e))
+        while more:
+            children.setdefault(e.parent, []).append(e.pid)
+            more = k.Process32NextW(snapshot, ctypes.byref(e))
+    finally:
+        k.CloseHandle(snapshot)
+    total, seen, todo = 0, set(), [pid]
+    while todo:
+        p = todo.pop()
+        if p in seen:   # (Windows reuses ids: a parent id can name a newer process, and even loop)
+            continue
+        seen.add(p)
+        todo += children.get(p, [])
+        handle = k.OpenProcess(0x1000, 0, p)   # (PROCESS_QUERY_LIMITED_INFORMATION)
+        if handle:
+            c = ProcessMemory()
+            c.cb = ctypes.sizeof(ProcessMemory)
+            if psapi.GetProcessMemoryInfo(handle, ctypes.byref(c), c.cb):
+                total += c.ws
+            k.CloseHandle(handle)
+    return total
+
+
 def rss_mb(proc):
     """A running compiler's resident memory in MB (0: not known, or not started yet)"""
     if proc is None:
         return 0
     try:
         if os.name == "nt":
-            c = ProcessMemory()
-            c.cb = ctypes.sizeof(ProcessMemory)
-            ok = ctypes.WinDLL("psapi").GetProcessMemoryInfo(ctypes.c_void_p(int(proc._handle)), ctypes.byref(c), c.cb)
-            return c.ws >> 20 if ok else 0
+            return tree_ws(proc.pid) >> 20
         return tree_rss(proc.pid) >> 20
     except (OSError, ValueError, AttributeError, IndexError):
         return 0
@@ -492,7 +537,7 @@ def flag_text(fl):
 
 def object_key(src, fl, deps):
     """What an object depends on: its source, the flags (flag_text), and the headers."""
-    return hashlib.sha1(open(src, "rb").read() + flag_text(fl).encode() + deps).hexdigest()
+    return hashlib.sha1(open(src, "rb").read() + flag_text(fl).encode() + deps, usedforsecurity=False).hexdigest()
 
 
 def times_from(path):
@@ -569,7 +614,7 @@ def migrate_stamps(gen, obj_dir, fl, deps):
             continue
         src = os.path.join(gen, f)
         content = open(src, "rb").read()
-        if open(stamp).read() == hashlib.sha1(content + " ".join(fl).encode() + deps).hexdigest():
+        if open(stamp).read() == hashlib.sha1(content + " ".join(fl).encode() + deps, usedforsecurity=False).hexdigest():
             key = object_key(src, fl, deps)
             open(stamp, "w").write(key)
             cache_put(obj, key)
@@ -710,15 +755,15 @@ def main():
         # (the profile's contents in the flags the object key hashes: its path alone stays the same across releases, so an update with a
         # new profile kept the hot code built from the old one)
         with open(PGO, "rb") as f:
-            hot_fl = hot_fl + ["-fprofile-instr-use=" + PGO, "-DHOOKSHOT_PROFILE_SHA1=" + hashlib.sha1(f.read()).hexdigest()[:16]]
+            hot_fl = hot_fl + ["-fprofile-instr-use=" + PGO, "-DHOOKSHOT_PROFILE_SHA1=" + hashlib.sha1(f.read(), usedforsecurity=False).hexdigest()[:16]]
     jobs = [(cc, s, os.path.join(obj_dir, os.path.basename(s)[:-2] + ".o"),
              hot_fl if os.path.basename(s).startswith("code_hot") else fl,
              shim_deps if os.path.dirname(s) == NX2_RT else deps) for s in srcs]
     # (issue 624) what the game code's object keys are made of, as short fingerprints: two builds' logs side by side say which part
     # changed when an update compiled everything again (the headers, the flags, the profile, or the lifted code itself)
-    fp = lambda b: hashlib.sha1(b).hexdigest()[:10]
+    fp = lambda b: hashlib.sha1(b, usedforsecurity=False).hexdigest()[:10]
     norm = lambda f: flag_text(f).encode()
-    code = hashlib.sha1()
+    code = hashlib.sha1(usedforsecurity=False)
     for code_src in sorted(x for x in srcs if os.path.basename(x).startswith("code_")):
         code.update(os.path.basename(code_src).encode() + open(code_src, "rb").read())
     print("object keys: game-code headers %s, flags %s, hot flags %s, lifted code %s (%d files)" % (
@@ -773,7 +818,7 @@ def main():
         vk = os.path.join(GPU, "vk")
         # (what the shader caches are good for: what translates shaders, not the whole DLL, so a build that changes something else
         # keeps them)
-        stamp = hashlib.sha1()
+        stamp = hashlib.sha1(usedforsecurity=False)
         translator = [os.path.join(d, f) for top in ("eden", "sirit", "compat") for d, _, fs in os.walk(os.path.join(vk, top)) for f in fs]
         for f in sorted(translator) + [os.path.join(vk, n) for n in ("vk_shader.cpp", "vk_bank.cpp", "vk_state.h", "vk_api.h")]:
             with open(f, "rb") as src:

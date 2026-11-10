@@ -68,11 +68,13 @@ extern thread_local uint32_t g_nvn2_compute_ssbo_count;
 extern thread_local uint32_t g_nvn2_compute_layout_end;
 extern thread_local bool g_nvn2_miss_log_this;
 extern thread_local bool g_all_global_this;
+extern thread_local bool g_gm_port_this;
 }
 namespace mkwvk {
 struct NvnState;
 uint32_t compute_ssbo_table(const NvnState& s, uint32_t* count, uint32_t* layout_end);   // (vk_bank.cpp)
 bool seed_cs_buffer_word(uint32_t offset);   // (vk_bank.cpp)
+bool key_listed(const char* hex, const char* var);   // (below)
 }
 namespace {
 bool ptr_diag_on() {
@@ -1447,12 +1449,15 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                     }
                 Shader::Optimization::g_all_global_this = all_global;
                 if (all_global) logf("vk: program %s: every memory access left global (RX_VK_ALL_GLOBAL_PROGS)", hex);
+                Shader::Optimization::g_gm_port_this = key_listed(hex, "EDEN_NX2_GM_PORT_PROGS");
+                if (Shader::Optimization::g_gm_port_this) logf("vk: program %s: the Fritchii tracking (EDEN_NX2_GM_PORT_PROGS)", hex);
             }
             struct ResetTable {
                 ~ResetTable() {
                     Shader::Optimization::g_nvn2_compute_ssbo_base = 0, Shader::Optimization::g_nvn2_compute_ssbo_count = 16;
                     Shader::Optimization::g_nvn2_compute_layout_end = 0;
                     Shader::Optimization::g_all_global_this = false;
+                    Shader::Optimization::g_gm_port_this = false;
                 }
             } reset_table;
             auto t = translate(env, false);
@@ -1517,6 +1522,10 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
             for (int i = 0; i < 16; i++) vrt.generic_input_types[i] = attribute_type_of(s.vattr[i]);
             vrt.previous_stage_stores.mask.set();
             vrt.convert_depth_mode = host->depth_minus_w() != 0;
+            // Deku Tree web (#455): with DontInline, NVIDIA's compiled vertex shader substitutes the grid-origin
+            // load result for the grid dimensions in the coordinate clamps. The SPIR-V names the right result.
+            constexpr uint64_t kDekuWebVertexCode = 0xb449bcdb69b36a8aull;
+            vrt.inline_global_128_loads = dev.props.vendorID == 0x10DE && vsc->key == kDekuWebVertexCode;
             Stage v;
             v.nvn_stage = 0;
             const std::vector<uint32_t> vspirv = Shader::Backend::SPIRV::EmitSPIRV(profile(), vrt, vs->program, bindings);
@@ -2123,6 +2132,17 @@ void program_wait(const Program* p) {
     if (p && !p->ready.load(std::memory_order_acquire)) jobs_wait(p->ready);
 }
 
+/// (hookshot) Whether the environment variable var lists hex (key prefixes, comma-separated)
+bool key_listed(const char* hex, const char* var) {
+    const char* list = getenv(var);
+    for (const char* q = list ? list : ""; *q;) {
+        const char* e = strchr(q, ',');
+        const size_t len = e ? (size_t)(e - q) : strlen(q);
+        if (len && !strncmp(hex, q, len)) return true;
+        q = e ? e + 1 : q + len;
+    }
+    return false;
+}
 uint64_t program_cache_stamp() { return disk_stamp(); }
 /// (the precompile, before the game: vk_draw.cpp) the kept compute programs and those named, ready, each given to fn. The rest of the
 /// game's programs stay on disk until a draw asks for one

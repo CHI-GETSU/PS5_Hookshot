@@ -1,6 +1,7 @@
-"""NVIDIA DLSS's camera jitter for Ocarina of Time 1.1.1: C added after a few instructions of the game (a64_lift.py Lifter.after).
+"""The temporal upscalers' camera jitter for Ocarina of Time 1.1.1: C added after a few instructions of the game (a64_lift.py
+Lifter.after). One jitter for both: NVIDIA DLSS (gpu/vk/vk_dlss.cpp) and AMD FSR 3.1 (gpu/vk/vk_fsr3_inputs.cpp).
 
-DLSS (gpu/vk/vk_dlss.cpp) resolves detail finer than a pixel from frames whose camera moved by a different fraction of a
+A temporal upscaler resolves detail finer than a pixel from frames whose camera moved by a different fraction of a
 pixel each time. The game's cameras do not move so: these sites give the scene's projection a sub-pixel offset each frame,
 in the GPU's copy only. The game fills each view's uniform buffers in one function (main+0x6bc520): for each view it loads
 the view's projection matrix (the view at x28, its projection's rows at +0x1a8) and writes it, the view-projection made from
@@ -15,16 +16,14 @@ moved by a sixth of a shadow texel each frame (up to a third; 0.003 without the 
 the game set it.
 
 host/rx_backend.c hos_dlss_jitter_clip picks the jitter and checks the projection is one of the picture's: perspective, of
-16:9 or the window's ratio (nx2/oot_wide.py). It is none (the game as shipped) unless DLSS runs, and the renderer reads the
-offset back from the camera's uniform buffer. Which view is the scene's, the renderer learns from its draws, too late for
+16:9 or the window's ratio (nx2/oot_wide.py). It is none (the game as shipped) unless DLSS or FSR 3.1 runs (the renderer's
+rx_option HOS_OPT_DLSS_JITTER_W and _H are 0 otherwise), and the renderer reads the offset back from the camera's uniform
+buffer. Which view is the scene's, the renderer learns from its draws, too late for
 this: the other views of the picture's ratio (a reflection, a portrait) are drawn without DLSS and move by under a pixel
 of the scene's size, too little to see.
 
-Installed only in a build with NVIDIA's DLSS SDK (make_game.py sets OOT_DLSS_JITTER=1 for the lift then): other builds have
-none of this code.
+Installed in every standalone lift (nx2/lift.py): FSR 3.1 needs no SDK, so a build without NVIDIA's has the jitter too.
 """
-
-import os
 
 import oot_wide
 
@@ -44,13 +43,8 @@ def _text(xreg, yreg):
     add = "".join("{ float _o; memcpy(&_o, (uint8_t *)c->vreg[%d] + 8, 4); _o += _j[%d]; memcpy((uint8_t *)c->vreg[%d] + 8, &_o, 4); } "
                   % (r, axis, r) for axis, r in ((0, xreg), (1, yreg)) if r is not None)
     return ("{ extern int hos_dlss_jitter_clip(uint64_t projection, float out[2]); float _j[2]; "
-            "if (hos_dlss_jitter_clip(c->x[%d] + %#x, _j)) { %s} }   /* (nx2/oot_jitter.py: DLSS camera jitter) */"
+            "if (hos_dlss_jitter_clip(c->x[%d] + %#x, _j)) { %s} }   /* (nx2/oot_jitter.py: the upscalers' camera jitter) */"
             % (VIEW, PROJECTION, add))
-
-
-def wanted():
-    """A build with NVIDIA DLSS (make_game.py: HOOKSHOT_NGX_SDK with its library): OOT_DLSS_JITTER=1, in the lift's key"""
-    return os.environ.get("OOT_DLSS_JITTER") == "1"
 
 
 def install(lifter, img):

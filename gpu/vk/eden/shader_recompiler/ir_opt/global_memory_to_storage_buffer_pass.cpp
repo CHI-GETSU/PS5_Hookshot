@@ -47,6 +47,7 @@ thread_local PointerDiag g_pointer_diag{};
 extern thread_local u32 g_nvn2_compute_ssbo_base;
 extern thread_local u32 g_nvn2_compute_ssbo_count;
 extern thread_local bool g_all_global_this;   // (RX_VK_ALL_GLOBAL_PROGS, vk_shader.cpp: no access of this program bound)
+extern thread_local bool g_gm_port_this;      // (EDEN_NX2_GM_PORT_PROGS, vk_shader.cpp: the port for this program)
 
 namespace {
 bool PointerDiagOn() {
@@ -83,11 +84,20 @@ bool GmLegacy() {
 /// (v2.0.3: no floating trees, issue #729) and the dark characters were lighting, which the fragment stage reads (light probes).
 /// EDEN_NX2_GM_SPLIT=1: that split; unset or 0: the tracking as before everywhere (v2.0.4/v2.0.5's default). Off by default again
 /// (2026-11-08 test): with it the cold precompile of the 10340 compute programs took 650 s instead of ~130 s.
+/// (floating trees, issue 994: the full split removed them but tore the cliffs) EDEN_NX2_GM_SPLIT=2: the port for the geometry
+/// stages only; =3: for compute programs only. EDEN_NX2_GM_PORT_PROGS=<key prefix>[,...]: the port for those programs alone (the
+/// bisection of which program places the trees)
 bool GmLegacyFor(Stage stage) {
+    if (g_gm_port_this) return false;
     static const char* const forced{std::getenv("EDEN_NX2_GM_LEGACY")};
     if (forced && *forced) return GmLegacy();
-    static const bool split{EnvSwitch("EDEN_NX2_GM_SPLIT", false)};
-    return !split || stage == Stage::Fragment;
+    static const int split{std::getenv("EDEN_NX2_GM_SPLIT") ? std::atoi(std::getenv("EDEN_NX2_GM_SPLIT")) : 0};
+    switch (split) {
+    case 1: return stage == Stage::Fragment;
+    case 2: return stage == Stage::Fragment || stage == Stage::Compute;
+    case 3: return stage != Stage::Compute;
+    default: return true;
+    }
 }
 bool GmNative() {
     static const bool on{EnvSwitch("EDEN_NX2_GM_NATIVE", true)};

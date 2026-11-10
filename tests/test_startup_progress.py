@@ -147,7 +147,7 @@ def main():
     prep = draw[draw.index("bool prepare_run("):]
     prep = prep[:prep.index("\n}\n")]
     stop_at = prep.index("if (prepare_stopped()) {")
-    if prep.index('fwrite(&stamp', stop_at) < prep.index("return false;", stop_at):
+    if prep.index('prepared_write(', stop_at) < prep.index("return false;", stop_at):
         raise SystemExit("a stopped preparation writes the stamp that says it is all done")
     for host in ("host/display.c", "host/posix/display_sdl.c"):
         text = (ROOT / host).read_text(encoding="utf-8")

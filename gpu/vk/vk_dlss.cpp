@@ -99,7 +99,10 @@ DlssWhy dlss_why() {
 int dlss_mode() {
     if (dlss_why() != DLSS_OK) return 0;
     static const int env = env_switch("RX_VK_DLSS");
-    return std::clamp(env >= 0 ? env : opts.dlss, 0, 2);
+    // (the Upscaler row has values past DLAA, FSR 3.1's (upscaler_rows.h): those are not DLSS, so the game's own as far as this
+    // is concerned, never clamped onto DLAA)
+    const int v = env >= 0 ? env : opts.dlss;
+    return v == 1 || v == 2 ? v : 0;
 }
 bool dlss_wanted() { return dlss_mode() != 0; }
 bool dlss_full_scale() { return dlss_mode() == 2; }

@@ -207,8 +207,15 @@ def _read_at_most(response, limit):
     return data
 
 
+def _https(url):
+    """Only https links are fetched (never file:, ftp: or a plain http: link from a release's answer)."""
+    if not isinstance(url, str) or not url.startswith("https://"):
+        raise ValueError("not an https link: %r" % (url,))
+    return url
+
+
 def _request(url, timeout, limit=MAX_DOWNLOAD):
-    req = urllib.request.Request(url, headers={"User-Agent": "Hookshot", "Accept": "application/vnd.github+json"})
+    req = urllib.request.Request(_https(url), url, headers={"User-Agent": "Hookshot", "Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return _read_at_most(response, limit)
 
@@ -227,7 +234,7 @@ def _api_download(url):
     import json
     for asset in json.loads(info.decode("utf-8")).get("assets", []):
         if asset.get("name") == name:
-            req = urllib.request.Request(asset["url"], headers={
+            req = urllib.request.Request(_https(asset.get("url")), headers={
                 "User-Agent": "Hookshot", "Accept": "application/octet-stream"})
             with urllib.request.urlopen(req, timeout=120) as response:
                 return _read_at_most(response, MAX_DOWNLOAD)
@@ -377,7 +384,7 @@ def _finish_tree(dest):
     tools = os.path.join(dest, "usr", "share", "hookshot")
     apprun = os.path.join(dest, "AppRun")
     shutil.copyfile(os.path.join(tools, "builder", "linux", "AppRun"), apprun)
-    os.chmod(apprun, 0o755)
+    os.chmod(apprun, 0o755)   # (rwxr-xr-x: the launcher must run; only its owner may change it)
     icon = os.path.join(tools, "assets", "hookshot.png")
     if os.path.isfile(icon):
         shutil.copyfile(icon, os.path.join(dest, "hookshot.png"))

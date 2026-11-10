@@ -15,6 +15,7 @@ Another game version leaves the functions out (and says so).
 """
 import glob
 import os
+import whole_write   # (rewrites written beside and moved over: issue 1197)
 
 CONFIG_HEAD = "void f_806702e0(Ctx *__restrict A64_NOESC c) {"
 CONFIG_ANCHOR = "    c->x[14]=recomp_load8(c,c->x[0] + 1354);\n"
@@ -90,8 +91,7 @@ def apply(gen):
                 done[what] += 1
                 print("oot_native_resolution: %s in %s" % (what, os.path.basename(path)))
         if out != s:
-            with open(path, "w", encoding="utf-8", newline="") as f:
-                f.write(out)
+            whole_write.write_whole(path, out, newline="")
     for what, n in done.items():
         if n != 1:
             print("oot_native_resolution: WARNING: the %s was found %d times" % (what, n))

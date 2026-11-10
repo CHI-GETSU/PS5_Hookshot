@@ -263,7 +263,7 @@ def main():
                 # from two archives is one)
                 end = struct.unpack_from("<I", control, 0x44)[0]
                 control, code = control[:0xd8], code[:end] if end <= len(code) else code
-                key = int.from_bytes(hashlib.sha1(control + code).digest()[:8], "little")
+                key = int.from_bytes(hashlib.sha1(control + code, usedforsecurity=False).digest()[:8], "little")
                 if key not in stage_index:
                     stage_index[key] = len(stage_list)
                     stage_list.append((key, stage, control, code))

@@ -17,7 +17,7 @@ namespace HookshotBuilder;
 /// through Game files > Build > Play. The game's update offer (Updater.cs) opens the same window on its update screen.
 public partial class MainWindow : Window
 {
-    const long NeededBytes = 60L << 30;
+    const long NeededBytes = 45L << 30;   // (measured 2026-11-09: the game data 24.4 GB, the shader caches ~8 GB, the game 0.4 GB, the build files ~5 GB at their peak; the rest headroom)
     Language lang = Strings.Default();
     string T(S s) => (int)s < lang.Text.Length ? lang.Text[(int)s] : Strings.All[0].Text[(int)s];
 
@@ -530,12 +530,12 @@ public partial class MainWindow : Window
             var free = new DriveInfo(root).AvailableFreeSpace;
             SpaceBar.Value = Math.Min(1, NeededBytes / (double)Math.Max(1, free));
             SpaceBar.Foreground = (Brush)FindResource(free >= NeededBytes ? "Go" : "Bad");
-            SpaceText.Text = $"Needs 60 GB · {root.TrimEnd('\\')} has {free >> 30} GB free";
+            SpaceText.Text = $"Needs 45 GB · {root.TrimEnd('\\')} has {free >> 30} GB free";
             SpaceText.Foreground = (Brush)FindResource(free >= NeededBytes ? "InkSoft" : "Bad");
         }
         catch (Exception)
         {
-            SpaceText.Text = "Needs 60 GB";
+            SpaceText.Text = "Needs 45 GB";
         }
         RefreshMode();
     }
@@ -621,7 +621,7 @@ public partial class MainWindow : Window
         WorkReset.Visibility = Storage.WorkChosen ? Visibility.Visible : Visibility.Collapsed;
         WorkNote.Text = Storage.KeepBuildFiles
             ? $"Build files: about {Storage.Gb(Storage.BuildFilesBytes)}, kept in {work} so that updates are quick (HOOKSHOT_KEEP_BUILD_FILES)."
-            : $"Build files: about {Storage.Gb(Storage.BuildFilesBytes)} in {work} while it builds, deleted when the game is ready.";
+            : $"Build files: about {Storage.Gb(Storage.BuildFilesBytes)} in {work} while it builds; when the game is ready about 1 GB stays (the compiled code) so that updates compile only what changed.";
         WorkNote.Foreground = (Brush)FindResource("InkSoft");
         try
         {
@@ -1007,14 +1007,14 @@ public partial class MainWindow : Window
         StorageRow.Visibility = Visibility.Visible;
     }
 
-    // (players asked for the space back: the build files (translated code, compiled objects), the setup's and updater's downloads and
-    // older builder versions go as soon as the game is ready. The next update then translates and compiles again (about as long as
-    // this build). HOOKSHOT_KEEP_BUILD_FILES=1 keeps them for quick updates, with the Free up space button as before)
+    // (players asked for the space back: the translated code, the setup's and updater's downloads and older builder versions go as soon
+    // as the game is ready. The compiled objects stay (~1 GB): without them every update compiled all ~600 files again, an hour and
+    // more (issue 1287). Free up space lets them go too. HOOKSHOT_KEEP_BUILD_FILES=1 keeps everything)
     async Task FreeAfterBuild()
     {
         if (!Storage.KeepBuildFiles)
         {
-            var left = await Task.Run(Storage.Free);
+            var left = await Task.Run(() => Storage.Free(afterBuild: true));
             if (left >= 100L << 20) AddLog($"build files: {Storage.Gb(left)} could not be deleted (a file in use); they go after the next build");
         }
         await ShowStorageUse();
@@ -1024,7 +1024,7 @@ public partial class MainWindow : Window
     {
         FreeButton.IsEnabled = false;
         FreeButton.Content = "Freeing…";
-        var left = await Task.Run(Storage.Free);
+        var left = await Task.Run(() => Storage.Free());
         await ShowStorageUse();
         if (left >= 100L << 20)
             StorageNote.Text += $" ({Storage.Gb(left)} could not be deleted: a file is in use. Close the game and the builder, and delete the folder's contents by hand.)";

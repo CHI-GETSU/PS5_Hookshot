@@ -285,6 +285,19 @@ class Copy(Case):
         self.assertEqual(code, 1)
         self.assertIn("both the source and the target", err)
 
+    def test_backup_inside_target_refused_before_copy(self):
+        self.backups = self.hs / "backups"
+        before = tree(self.hs)
+        for extra in ((), ("--dry-run",)):
+            with self.subTest(extra=extra), mock.patch.object(
+                oot.shutil, "copytree", side_effect=AssertionError("recursive backup copy started")
+            ):
+                code, _, err = self.run_main("import", "--from", str(self.li), "--hookshot", str(self.hs), *extra)
+                self.assertEqual(code, 1)
+                self.assertIn("--backup-dir outside the target save folder", err)
+                self.assertFalse(self.backups.exists())
+                self.assertEqual(tree(self.hs), before)
+
     def test_keep_settings(self):
         code, out, err = self.run_main("export", "lichii", "--keep-settings")
         self.assertEqual(code, 0, err)

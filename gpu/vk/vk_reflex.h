@@ -23,6 +23,8 @@ void reflex_swapchain_info(VkSwapchainCreateInfoKHR& ci);
 bool reflex_swapchain_stale();
 /// A swapchain made: its sleep mode set as the menu has it
 void reflex_swapchain_created(VkSwapchainKHR swapchain);
+/// Before destroying the current swapchain, including a failed replacement: stop using it for latency calls
+void reflex_swapchain_destroyed();
 /// The frame's markers, at the game's present: its simulation ended and its rendering's submission starts
 void reflex_present_begins();
 /// Before the present's submit: the rendering's submission ended

@@ -180,17 +180,28 @@ void hos_mods_init(const char *image_path) {
 
 /* nn_fs.c: the mod file for a RomFS path ("UI/x.zs", no mount, no leading slash), or 0 */
 int hos_mods_romfs(const char *rel, char *out, size_t cap) {
-    if (!table_n) return 0;
     char key[MAX_PATH];
     snprintf(key, sizeof key, "%s", rel);
     lower_slash(key);
-    Entry *e = find(key);
-    if (!e || e->is_dir) return 0;
+    int hos_prompts_romfs(const char *key, char *out, size_t cap);   /* prompts.c: the button prompts, where no mod has the file */
+    Entry *e = table_n ? find(key) : NULL;
+    if (!e || e->is_dir) return hos_prompts_romfs(key, out, cap);
     snprintf(out, cap, "%s", e->host);
     static volatile LONG logged;
     if (!e->logged && InterlockedIncrement(&logged) <= 200) hos_log("mods: %s <- %s", rel, e->host);
     e->logged = 1;
     return 1;
+}
+
+/* prompts.c: 1 when a mod has a file whose key (lower case, '/') starts with prefix and ends with suffix */
+int hos_mods_has(const char *prefix, const char *suffix) {
+    const size_t pn = strlen(prefix), sn = strlen(suffix);
+    for (size_t i = 0; i < table_cap; i++) {
+        const char *k = table[i].key;
+        const size_t kn = k ? strlen(k) : 0;
+        if (k && !table[i].is_dir && kn >= pn + sn && !strncmp(k, prefix, pn) && !strcmp(k + kn - sn, suffix)) return 1;
+    }
+    return 0;
 }
 
 /* nn_fs.c, listing a RomFS folder: fn(arg, name, is_dir, size) for each mod entry directly in it that the game's own

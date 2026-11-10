@@ -34,7 +34,7 @@ void hos_mouse_give_back(int32_t dx, int32_t dy);                               
 int rx_option(int id, int otherwise);
 extern double hos_mouse_sens;
 
-enum { LIMITS_AT = 0x178, PITCH_AT = 0x18c, YAW_AT = 0x1a4 };
+enum { LIMITS_AT = 0x178, PITCH_AT = 0x18c, YAW_AT = 0x1a4, STATE_AT = 0x204 };
 #define LIVE_NS 150000000LL   /* (the hook ran this recently: the camera takes the mouse) */
 #define DEG_PER_COUNT 0.1
 
@@ -69,6 +69,27 @@ static int looks_like_camera(uint64_t cam) {
 /* f_80644c80's first line (nx2/oot_patches.py): cam is the player camera, the game's thread */
 void hos_mouse_camera(uint64_t cam) {
     if (!cam || !native_on() || !looks_like_camera(cam)) return;
+    /* Only while it is the view: following Link (3) or turned by the player (4). Aiming the slingshot in first person
+       leaves this camera updating with its state 0 while another one draws (traced at Hyrule Castle); shops are reported
+       the same. In any other state the mouse is the right stick, which those views turn by (the hook counts as not
+       run, so hos_mouse_native gives -1) */
+    uint32_t state;
+    memcpy(&state, GP(cam + STATE_AT), 4);
+    if (state != 3 && state != 4) {
+        /* (at once: the stick takes the next motion, not one burst once the 150 ms run out) */
+        InterlockedExchange64(&last_hook_ns, 0);
+        /* (each state seen leaving the mouse to the stick, once: what another view, Z-targeting, climbing or swimming,
+           is, to add here if one of them should turn with the mouse) */
+        static uint32_t said[8];
+        static int nsaid;
+        int seen = 0;
+        for (int i = 0; i < nsaid; i++) seen |= said[i] == state;
+        if (!seen && nsaid < 8) {
+            said[nsaid++] = state;
+            hos_log("mouse native: camera state %u: the mouse is the right stick", state);
+        }
+        return;
+    }
     InterlockedExchange64(&last_hook_ns, hos_now_ns());
     if (InterlockedExchange64(&last_camera, (LONG64)cam) != (LONG64)cam && cameras_seen++ < 8)
         hos_log("mouse native: the player camera at %#llx turns with the mouse", (unsigned long long)cam);

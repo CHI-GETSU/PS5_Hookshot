@@ -25,6 +25,8 @@ mkw-recomp's changes, for the Switch 2:
 - **The window crop** (`rx_present_crop`): MKW renders at a dynamic size into a 3840x2160 window texture and crops
   it; the crop is copied out and presented.
 
-`mkw_gpu.cpp` / `mkw_gpu.h` / `build-gpu.bat` are the earlier Vulkan stand-in (a window and a swapchain; no longer
-loaded). `shadertool.cpp` runs dumped NVN2 programs through Eglantine's recompiler offline (SPIR-V; it prints what
-each program reads from the constant banks).
+The renderer the game uses by default is no longer this one but the Vulkan back end in `vk/` (`vk/VULKAN.md`); this
+one stays as the fallback (on Windows, in a build made with wgpu-native). mkw-recomp's earlier Vulkan stand-in
+(`mkw_gpu.cpp`, `build-gpu.bat`) did not come over. `shadertool.cpp` (built by `build-shadertool.bat` against the
+Eglantine clone) runs dumped NVN2 programs through Eglantine's recompiler offline (SPIR-V; it prints what each program
+reads from the constant banks).

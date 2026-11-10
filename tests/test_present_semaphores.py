@@ -1,6 +1,6 @@
 """Compile actual swapchain lifecycle/selection statements with CPU Vulkan stubs.
 Usage: python -I -B tests/test_present_semaphores.py [--cxx clang++]
-The old source must fail the four-images/three-frame-slots sequence. No GPU.
+Checks per-image ownership and recovery from recreation failures. No GPU.
 """
 import argparse
 from pathlib import Path
@@ -20,28 +20,53 @@ signal = re.search(r'    signal\.semaphore = [^;]+;', present)[0]
 wait = re.search(r'    pi\.pWaitSemaphores = [^;]+;', present)[0]
 acquire_wait = re.search(r'    waits\[0\]\.semaphore = [^;]+;', present)[0]
 assert 'acquire_timeout, f.acquired, VK_NULL_HANDLE, &index)' in present
-# (from the image query after the swapchain is made: since PR 492 its creation is a result checked and logged)
-start = main.index('    if (vkGetSwapchainImagesKHR(dev.device, sc, &n, nullptr)')
+# Include the actual creation attempt: passing oldSwapchain retires it even on failure.
+start = main.index('    ci.oldSwapchain = dev.swapchain;')
 end = main.index('    logf("vk: swapchain', start)
 tail = main[start:end]
+begin = present[present.index('{') + 1:present.index('    if (src) {')]
+reflex = (source/'gpu/vk/vk_reflex.cpp').read_text()
+reset_start = reflex.index('void reflex_swapchain_destroyed(') if 'void reflex_swapchain_destroyed(' in reflex else -1
+reset = reflex[reset_start:reflex.index('\n}', reset_start)+2] if reset_start >= 0 else 'void reflex_swapchain_destroyed() {}'
 fixture = r'''
 #include <vector>
 #include <set>
 #include <cstdint>
 #include <cstdio>
 #include <utility>
-using VkSemaphore=uint64_t; using VkImage=uint64_t;
+#include <atomic>
+#include <mutex>
+using VkSemaphore=uint64_t; using VkImage=uint64_t; using VkSwapchainKHR=uint64_t; using VkResult=int;
 constexpr uint64_t VK_NULL_HANDLE=0;
 constexpr int VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO=1, VK_SUCCESS=0;
+constexpr int VK_PRESENT_MODE_MAILBOX_KHR=1, VK_PRESENT_MODE_IMMEDIATE_KHR=2;
 struct VkSemaphoreCreateInfo { int type; };
 struct Extent { uint32_t width,height; };
 struct Device { int device=1;uint64_t swapchain=0;int swap_format=0;Extent swap_extent{};
-    std::vector<VkImage> swap_images;std::vector<VkSemaphore> swap_rendered; } dev;
+    std::vector<VkImage> swap_images;std::vector<VkSemaphore> swap_rendered;
+    std::atomic<uint64_t> swap_resize{0};std::mutex present_mu; } dev;
 unsigned image_count=4, made=0, fail_at=0;uint64_t serial=1000;
-int query_result=0;uint64_t destroyed_swapchain=0;
+int query_result=0,data_result=0;uint64_t destroyed_swapchain=0;
 bool idle=false, bad_destroy=false; std::set<uint64_t> live,used;
+std::set<uint64_t> chains, retired;
+uint64_t next_chain=0;int create_result=0;bool bad_chain=false;
+struct CreateInfo {uint64_t oldSwapchain=0;unsigned imageUsage=1,minImageCount=4;};
+void reflex_swapchain_info(CreateInfo&) {}
+struct Reflex {uint64_t swapchain=0,swapchain_generation=0;bool latency=false,frame_marked=false;int mode=-1;std::mutex mu;} cached;
+Reflex& rx(){return cached;}
+void reflex_swapchain_created(uint64_t sc) {cached.swapchain=sc;cached.latency=cached.frame_marked=true;cached.mode=1;}
+''' + reset + r'''
+template<class... T> void logf(const char*,T...) {}
+int vkCreateSwapchainKHR(int,const CreateInfo* ci,void*,uint64_t* out) {
+    if(ci->oldSwapchain) {
+        if(!chains.count(ci->oldSwapchain) || retired.count(ci->oldSwapchain))bad_chain=true;
+        retired.insert(ci->oldSwapchain); // Vulkan retires oldSwapchain even on creation failure.
+    }
+    if(create_result)return create_result;
+    *out=++next_chain;chains.insert(*out);return 0;
+}
 int vkGetSwapchainImagesKHR(int,uint64_t,uint32_t* n,uint64_t* out) {
-    *n=image_count;if(out)for(unsigned i=0;i<*n;++i)out[i]=i;return query_result;
+    *n=image_count;if(out)for(unsigned i=0;i<*n;++i)out[i]=i;return out?data_result:query_result;
 }
 int vkCreateSemaphore(int,const VkSemaphoreCreateInfo*,void*,uint64_t* out) {
     if(++made==fail_at)return -1;*out=++serial;live.insert(*out);return 0;
@@ -49,15 +74,37 @@ int vkCreateSemaphore(int,const VkSemaphoreCreateInfo*,void*,uint64_t* out) {
 void vkDestroySemaphore(int,uint64_t s,void*) {
     if((used.count(s) && !idle) || !live.erase(s))bad_destroy=true;
 }
-void vkDestroySwapchainKHR(int,uint64_t sc,void*) {destroyed_swapchain=sc;}
+void vkDestroySwapchainKHR(int,uint64_t sc,void*) {
+    if(cached.swapchain==sc)bad_chain=true;
+    if(!chains.erase(sc))bad_chain=true;
+    retired.erase(sc);destroyed_swapchain=sc;
+}
 void queue_flush_locked() {}
 void vkDeviceWaitIdle(int) {idle=true;}
 // (vk_replay.cpp's helper: held submits out, then the device idle; the real one also takes the present queue's own lock)
 void device_wait_idle_locked() {queue_flush_locked();vkDeviceWaitIdle(dev.device);}
-bool recreate(uint64_t sc) {
+bool recreate() {
     uint32_t n=0,width=640,height=480; struct {int format=1;} fmt;
+    CreateInfo ci;int mode=0;VkResult result;
 ''' + tail + r'''
+    reflex_swapchain_created(sc);
     return true;
+}
+uint64_t pack(unsigned w,unsigned h) {return (uint64_t(w)<<32)|h;}
+unsigned called_width=0,called_height=0,acquires=0;
+bool preflight_fail=false,stale=false;uint64_t newer_resize=0;
+bool create_swapchain(unsigned width,unsigned height) {
+    called_width=width;called_height=height;
+    if(newer_resize)dev.swap_resize.store(newer_resize);
+    if(preflight_fail)return false;
+    return recreate();
+}
+bool reflex_swapchain_stale() {return stale;}
+std::mutex present_image_mu;
+void present_begin() {
+''' + begin + r'''
+    if(!dev.swapchain || !chains.count(dev.swapchain) || retired.count(dev.swapchain))bad_chain=true;
+    ++acquires; // The real prefix must return before the frame fence/acquire on failure.
 }
 struct Frame {uint64_t rendered,acquired;};
 uint64_t choose(unsigned index,unsigned frame_slot) {
@@ -71,7 +118,7 @@ uint64_t choose(unsigned index,unsigned frame_slot) {
     return signal.semaphore;
 }
 int main() {
-    if(!recreate(1))return 1;
+    if(!recreate())return 1;
     uint64_t pending[16]{};unsigned owner[16]{},count=0;
     // Only reacquiring image i releases its previous presentation wait.
     unsigned images[]={0,1,2,3,0,1,2,3,3,1,0,2};
@@ -86,24 +133,58 @@ int main() {
     }
     if(dev.swap_rendered.size()!=4 || live.size()!=4)return 4;
     auto old=dev.swap_rendered;image_count=2;idle=false;
-    if(!recreate(2) || bad_destroy || dev.swap_rendered.size()!=2 || live.size()!=2)return 5;
+    if(!recreate() || bad_destroy || dev.swap_rendered.size()!=2 || live.size()!=2)return 5;
     for(auto s:old)if(live.count(s))return 6;
     for(unsigned slot=0;slot<3;++slot)for(unsigned image=0;image<2;++image)
         if(choose(image,slot)!=dev.swap_rendered[image])return 9;
     image_count=5;idle=false;
-    if(!recreate(3) || bad_destroy || dev.swap_rendered.size()!=5 || live.size()!=5)return 10;
+    if(!recreate() || bad_destroy || dev.swap_rendered.size()!=5 || live.size()!=5)return 10;
     for(unsigned image=0;image<5;++image)if(choose(image,image%3)!=dev.swap_rendered[image])return 11;
-    // A successful CreateSwapchain retires the old chain, even if later setup fails.
-    // Only test resource cleanup/ownership here, never resumption on that retired chain.
-    old=dev.swap_rendered;auto previous=dev.swapchain;image_count=4;made=0;fail_at=3;
+    // Once creation has been attempted, the old chain cannot be acquired or used as oldSwapchain again.
+    image_count=4;made=0;fail_at=3;
     idle=false;
-    if(recreate(4) || destroyed_swapchain!=4 || dev.swapchain!=previous || dev.swap_rendered!=old || live.size()!=5)return 7;
+    if(recreate() || dev.swapchain || !dev.swap_rendered.empty() || !live.empty() || !chains.empty()) {
+        std::puts("FAIL: retired swapchain remains published after semaphore allocation failure");return 7;
+    }
     fail_at=0;made=0;query_result=-1;destroyed_swapchain=0;
-    if(recreate(5) || destroyed_swapchain!=5 || made || dev.swap_rendered!=old || live.size()!=5)return 12;
+    if(recreate() || dev.swapchain || made || !live.empty() || !chains.empty())return 12;
     query_result=0;image_count=0;destroyed_swapchain=0;
-    if(recreate(6) || destroyed_swapchain!=6 || made || dev.swap_rendered!=old || live.size()!=5)return 13;
-    if(bad_destroy)return 8;
-    std::puts("PASS: acquired-image reuse, frame acquire, recreation, allocation failure and image-query error/zero cleanup");
+    if(recreate() || dev.swapchain || made || !live.empty() || !chains.empty())return 13;
+    image_count=4;
+    if(!recreate())return 14;
+    create_result=-1;idle=false;
+    if(recreate() || dev.swapchain || !live.empty() || !chains.empty()) {
+        std::puts("FAIL: retired swapchain remains published after creation failure");return 15;
+    }
+    create_result=0;
+    if(!recreate() || !dev.swapchain || dev.swap_images.size()!=4)return 16;
+    data_result=1; // VK_INCOMPLETE from the image-data query must not publish a partial chain.
+    if(recreate() || dev.swapchain || !live.empty() || !chains.empty())return 17;
+    data_result=0;
+    if(!recreate())return 18;
+    dev.swap_resize.store(pack(1720,720));preflight_fail=true;
+    count=acquires;auto active=dev.swapchain;
+    present_begin();
+    if(acquires!=count || dev.swap_resize.load()!=pack(1720,720) || dev.swapchain!=active)return 19;
+    newer_resize=pack(3440,1440);
+    present_begin();
+    if(acquires!=count || dev.swap_resize.load()!=newer_resize)return 20;
+    preflight_fail=false;newer_resize=0;
+    present_begin();
+    if(acquires!=count+1 || called_width!=3440 || called_height!=1440 || dev.swap_resize.load())return 21;
+    create_result=-1;dev.swap_resize.store(pack(1920,1080));count=acquires;
+    present_begin();
+    if(acquires!=count || dev.swapchain || dev.swap_resize.load()!=pack(1920,1080))return 22;
+    create_result=0;present_begin();
+    if(acquires!=count+1 || !dev.swapchain || called_width!=1920)return 23;
+    stale=true;create_result=-1;count=acquires;present_begin();
+    if(acquires!=count || dev.swapchain || !dev.swap_resize.load())return 24;
+    stale=false;create_result=0;dev.swap_resize.store(0);present_begin();
+    if(acquires!=count+1 || !dev.swapchain)return 25; // Null-chain recovery without a resize notification.
+    if(bad_destroy || bad_chain)return 8;
+    reflex_swapchain_destroyed();
+    if(cached.swapchain || cached.latency || cached.frame_marked || cached.mode!=-1)return 26;
+    std::puts("PASS: per-image semaphores, retirement, query/allocation/create failures, latest-resize retry and acquire guard");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='present-semaphores-') as directory:

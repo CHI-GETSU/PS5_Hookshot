@@ -40,6 +40,7 @@ with tempfile.TemporaryDirectory() as romfs:
     write(os.path.join(tex, "Bake_Stage_G_2_2_d1_un3.bntx.zs"), ZSTD + b"u" * 60)
     write(os.path.join(romfs, "Lonely", "Only_One_Nrm.bntx.zs"), bytes(16))             # nothing of its kind beside it
     write(os.path.join(romfs, "Other", "plain.txt"), bytes(16))                         # not a .zs: not looked at
+    write(os.path.join(romfs, "Other", "Skip_A.bntx.zs"), b"\x5a\x2a\x4d\x18" + bytes(8) + ZSTD)  # a skippable frame first
 
     damaged = sorted(os.path.relpath(p, romfs) for p in nup.damaged_game_files(romfs))
     check("damaged", damaged, sorted(os.path.join(*p) for p in (
@@ -56,6 +57,31 @@ with tempfile.TemporaryDirectory() as romfs:
     check("no .part left", [n for _, _, fs in os.walk(romfs) for n in fs if n.endswith(".part")], [])
     check("a second pass", [os.path.relpath(p, romfs) for p, _ in nup.stand_in_damaged(romfs)],
           [os.path.join("Lonely", "Only_One_Nrm.bntx.zs")])
+    check("zstd starts", [nup.zstd_start(h) for h in (ZSTD, b"\x50\x2a\x4d\x18", b"\x5f\x2a\x4d\x18", b"\x60\x2a\x4d\x18",
+                                                       bytes(4), ZSTD[:3])], [True, True, True, False, False, False])
+
+# make_game's step: only in a romfs the builder unpacked (its stamp), once per unpack
+sys.path[:0] = [HERE, os.path.join(os.path.dirname(HERE), "third_party", "a64-kit", "tools")]
+mg_spec = importlib.util.spec_from_file_location("tested_make_game", os.path.join(HERE, "make_game.py"))
+make_game = importlib.util.module_from_spec(mg_spec)
+mg_spec.loader.exec_module(make_game)
+calls = []
+sys.modules["nup"] = type(sys)("nup")
+sys.modules["nup"].stand_in_damaged = lambda romfs: calls.append(romfs) or []
+with tempfile.TemporaryDirectory() as out:
+    romfs = os.path.join(out, "romfs")
+    os.makedirs(romfs)
+    make_game.stand_in_damaged_files(out, romfs)
+    check("no stamp: not the builder's romfs", calls, [])
+    with open(os.path.join(out, ".hookshot_romfs"), "w") as f:
+        f.write("unpacked by this builder: game.nup 1\n")
+    make_game.stand_in_damaged_files(out, romfs)
+    make_game.stand_in_damaged_files(out, romfs)
+    check("checked once", calls, [romfs])
+    with open(os.path.join(out, ".hookshot_romfs"), "w") as f:
+        f.write("unpacked by this builder: other.nup 2\n")
+    make_game.stand_in_damaged_files(out, romfs)
+    check("checked again for another unpack", calls, [romfs, romfs])
 
 if failures:
     print("\n".join(failures))

@@ -40,6 +40,18 @@ typedef struct {
     unsigned long long size;
     char dest[260], from[260], to[260], url[1024];
 } Part;
+/* the next non-empty line of a text, cut in place (its \r or \n made 0); *next moves past it. NULL at the end
+   (strtok's work without its hidden state) */
+static char *next_line(char **next) {
+    char *p = *next;
+    while (*p == '\r' || *p == '\n') p++;
+    if (!*p) return *next = p, (char *)NULL;
+    char *line = p;
+    while (*p && *p != '\r' && *p != '\n') p++;
+    if (*p) *p++ = 0;
+    *next = p;
+    return line;
+}
 /* a name from the setup list (a tag, or with path set a relative path with / or \ between its parts): letters, digits
    and . _ + - only, no ".." part, no drive, no root */
 static int list_name_ok(const char *s, int path) {
@@ -171,16 +183,56 @@ static int file_sha256(const wchar_t *path, char out[65]) {
     return ok;
 }
 
-static int run_wait(wchar_t *cmd, const wchar_t *dir) {
+typedef struct {
+    DWORD code, start_error, status_error, capture_error;
+    char error[512];
+} RunResult;
+
+static RunResult run_wait(wchar_t *cmd, const wchar_t *dir) {
+    RunResult result = {0};
+    HANDLE rd = NULL, wr = NULL, null = INVALID_HANDLE_VALUE;
+    SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, TRUE};
     STARTUPINFOW si = {sizeof si};
     PROCESS_INFORMATION pi;
     si.dwFlags = STARTF_USESHOWWINDOW, si.wShowWindow = SW_HIDE;
-    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, dir, &si, &pi)) return -1;
+    if (CreatePipe(&rd, &wr, &sa, 0)) {
+        if (SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0))
+            null = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+        if (null != INVALID_HANDLE_VALUE) {
+            si.dwFlags |= STARTF_USESTDHANDLES;
+            si.hStdInput = si.hStdOutput = null;   /* (setup has no console: supply valid inherited handles) */
+            si.hStdError = wr;
+        } else {
+            result.capture_error = GetLastError();
+            CloseHandle(rd), CloseHandle(wr);
+            rd = wr = NULL;
+        }
+    } else result.capture_error = GetLastError();
+    /* Capturing a diagnostic is optional: if pipe setup fails, keep the original child-process route. */
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, wr != NULL, CREATE_NO_WINDOW, NULL, dir, &si, &pi)) {
+        result.start_error = GetLastError();
+        if (rd) CloseHandle(rd);
+        if (wr) CloseHandle(wr);
+        if (null != INVALID_HANDLE_VALUE) CloseHandle(null);
+        return result;
+    }
+    if (wr) CloseHandle(wr);   /* (otherwise EOF never arrives on the parent's reader) */
+    if (null != INVALID_HANDLE_VALUE) CloseHandle(null);
+    if (rd) {
+        char buf[512];
+        DWORD n;
+        size_t kept = 0;
+        while (ReadFile(rd, buf, sizeof buf, &n, NULL) && n) {
+            size_t copy = n < sizeof result.error - 1 - kept ? n : sizeof result.error - 1 - kept;
+            memcpy(result.error + kept, buf, copy);
+            kept += copy;   /* (keep draining after this buffer fills, so a noisy child cannot block) */
+        }
+        CloseHandle(rd);
+    }
     WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD code = 1;
-    GetExitCodeProcess(pi.hProcess, &code);
+    if (!GetExitCodeProcess(pi.hProcess, &result.code)) result.status_error = GetLastError();
     CloseHandle(pi.hThread), CloseHandle(pi.hProcess);
-    return (int)code;
+    return result;
 }
 
 static void mkdirs(const wchar_t *path) {
@@ -514,7 +566,7 @@ static DWORD WINAPI work(LPVOID unused) {
     char tag[128] = "", run[260] = "";
     Part parts[MAX_PARTS];
     int nparts = 0;
-    for (char *line = strtok(man.p, "\r\n"); line; line = strtok(NULL, "\r\n")) {
+    for (char *next = man.p, *line; (line = next_line(&next)) != NULL;) {
         if (!strncmp(line, "tag ", 4)) sscanf(line + 4, "%127s", tag);
         else if (!strncmp(line, "run ", 4)) sscanf(line + 4, "%259s", run);
         else if (!strncmp(line, "part ", 5) && nparts < MAX_PARTS) {
@@ -621,7 +673,22 @@ static DWORD WINAPI work(LPVOID unused) {
             mkdirs(dest);
             GetSystemDirectoryW(sys, MAX_PATH);
             swprintf(tarcmd, 2 * MAX_PATH + 64, L"\"%ls\\tar.exe\" -xf \"%ls\" -C \"%ls\"", sys, zip, dest);
-            if (run_wait(tarcmd, dest) != 0) fail(L"Unpacking part %d of %d failed (Windows' tar.exe). Is there enough free space on C:?", i + 1, nparts);
+            RunResult tar = run_wait(tarcmd, dest);
+            if (tar.start_error) fail(L"Could not start Windows' tar.exe (Windows error %lu).\nArchive: %ls\nDestination: %ls", tar.start_error, zip, dest);
+            if (tar.status_error) fail(L"Could not read Windows' tar.exe exit status (Windows error %lu).\nArchive: %ls\nDestination: %ls", tar.status_error, zip, dest);
+            if (tar.code) {
+                wchar_t detail[512] = L"";
+                if (tar.capture_error) swprintf(detail, 512, L"Could not capture stderr (Windows error %lu).", tar.capture_error);
+                /* Best-effort UTF-8: tar may use an ANSI/OEM code page, or the byte cap may split a sequence. */
+                else MultiByteToWideChar(CP_UTF8, 0, tar.error, -1, detail, 512);
+                wchar_t heading[1024] = L"";
+                swprintf(heading, 1024, L"Unpacking part %d of %d failed: Windows' tar.exe exited with code %lu.\nArchive: %ls\nDestination: %ls\n%ls:\n",
+                         i + 1, nparts, tar.code, zip, dest,
+                         tar.capture_error ? L"Stderr unavailable" : L"Tar stderr excerpt (up to 511 bytes captured)");
+                heading[1023] = 0;
+                /* Keep both paths; the displayed excerpt uses only the space left in fail()'s 1024-wide message. */
+                fail(L"%ls%.*ls", heading, (int)(1023 - wcslen(heading)), detail);
+            }
             if (strcmp(p->from, "-") && strcmp(p->to, "-")) {   /* (llvm-mingw-<version>-ucrt-x86_64 -> llvm-mingw) */
                 wchar_t from[MAX_PATH], to[MAX_PATH], wf[260], wt[260];
                 w(p->from, wf, 260), w(p->to, wt, 260);

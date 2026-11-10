@@ -26,12 +26,20 @@ OS = "windows" if WINDOWS else "linux"
 # Arguments some tests need. {name} is a tool or folder found below (find_tools); a check whose tools are missing is
 # skipped, or fails with --strict. Tests not listed run with no arguments and their own defaults.
 ARGS = {
+    "tests/test_setup_tar_diagnostics.py": ["--cc", "gcc"],
+    "tests/test_display_startup_failure.py": ["--cxx", "{cxx}"],
+    "tests/test_frame_wait_bounds.py": ["--cxx", "{cxx}"],
+    "tests/test_fallback_buffer_cleanup.py": ["--cxx", "{cxx}"],
     "tests/test_mesh_args_cleanup.py": ["--cxx", "{cxx}"],
+    "tests/test_present_aspect.py": ["--cxx", "{cxx}"],
+    "tests/test_present_aspect_vulkan.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
     "tests/test_pipeline_cache_save.py": ["--cxx", "{cxx}"],
     "tests/test_capture_copy_runs.py": ["--cxx", "{cxx}"],
+    "tests/test_multiwait_wake.py": ["--cxx", "{cxx}"],
     "tests/test_parallel_rb_refresh.py": ["--cxx", "{cxx}"],
     "tests/test_prof_sampling.py": ["--cxx", "{cxx}"],
     "tests/test_screensaver.py": ["--cc", "gcc"],
+    "tests/test_linux_menu_font.py": ["--cc", "clang"],
     "tests/test_windows_display_startup.py": ["--cc", "gcc"],
     "tests/test_system_header_cache.py": ["--cc", "clang"],
     "tests/test_precompile_compute_guard.py": ["--cxx", "clang++"],
@@ -39,18 +47,23 @@ ARGS = {
     "tests/test_vulkan_copy_span.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
     "tests/test_vulkan_copy_span_gpu_compile.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
     "tests/test_input_background.py": ["--cc", "gcc"],
+    "tests/test_framegen_resources.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
     "tests/test_oot_wide_save_picture.py": ["--cc", "gcc"],
     "nx2/test_import_windows.py": ["--cxx", "g++"],
     "tests/test_lower_depbar.py": ["--cxx", "clang++"],
     "tests/test_lower_register_markers.py": ["--cxx", "clang++"],
     "tests/test_text_speed.py": ["--cc", "gcc"],
     "tests/test_audio_in.py": ["--cc", "gcc", "--cxx", "g++"],
+    "tests/test_linux_menu_utf8.py": ["--cc", "clang"],
     "tests/test_upscale_fallback.py": ["--cxx", "g++"],
     "tests/test_reserved_core.py": ["--cxx", "g++"],
+    "tests/test_fsr3_shaders.py": ["--glslang", "{glslang}", "--spirv-val", "{spirv_val}"],
     "tests/test_fg_scale_sharpen.py": ["--cxx", "g++"],
     "tests/test_taau_env_lookup.py": ["--cxx", "g++"],
     "tests/test_target_overlap.py": ["--cxx", "g++"],
     "tests/test_menu_hit.py": ["--cxx", "g++"],
+    "tests/test_menu_font_latin.py": ["--cc", "gcc"],
+    "tests/test_prompt_font_bind.py": ["--cc", "gcc"],
     "tests/test_stick_dead_zone.py": ["--cc", "gcc", "--cxx", "g++"],
     "tests/test_menu_restart.py": ["--cxx", "g++", "--cc", "gcc"],
     "tests/test_output_resolution.py": ["--cxx", "{cxx}"],
@@ -61,13 +74,17 @@ ARGS = {
     "tests/test_audio_voice_biquad.py": ["--cc", "gcc"],
     "tests/test_audio_output_menu.py": ["--cxx", "g++"],
     "tests/test_motion.py": ["--cc", "gcc"],
+    "tests/test_low_memory_notice.py": ["--cc", "gcc"],
     "tests/test_cpp_preflight.py": ["--cxx", "g++"],
     "tests/test_invalidate_vcore.py": ["--cxx", "g++"],
     "tests/test_linux_driver_fault_guard.py": ["--cxx", "{cxx}"],
+    "tests/test_gpl_cold_library.py": ["--cxx", "{cxx}"],
     "tests/test_seed_cs_pointers.py": ["--cxx", "g++"],
     "tests/test_program_record_head.py": ["--cxx", "g++"],
     "tests/test_seed_kept_loaded.py": ["--cxx", "g++"],
+    "tests/test_prepare_seed_stamp.py": ["--cxx", "g++"],
     "tests/test_lower_atomg_cas.py": ["--cxx", "g++"],
+    "tests/test_lower_lea_hi_constant.py": ["--cxx", "g++"],
     "tests/test_wb_diff_split.py": ["--cxx", "g++"],
     "tests/test_native_suatom.py": ["--cxx", "clang++"],
     "nx2/test_cbuf_table_extent.py": ["--cxx", "g++"],
@@ -82,6 +99,7 @@ ARGS = {
     "nx2/test_texture_init_barrier.py": ["--headers", "{vulkan_headers}"],
     "tests/test_parallel_init_order.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
     "tests/test_device_lost_exit.py": ["--cxx", "{cxx}"],
+    "tests/test_mesh_unreachable_outputs.py": ["--cxx", "{cxx}", "--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
     "nx2/test_default_point_size.py": ["--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
     "nx2/test_unsigned_image_types.py": ["--cxx", "{cxx}", "--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
     "nx2/test_depth_sample_types.py": ["--cxx", "{cxx}", "--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
@@ -105,18 +123,24 @@ SKIP = {
     "nx2/test_leaf.py": ({"linux", "windows"}, "needs the game's modules (work/dump) and Unicorn"),
     "nx2/test_dll.py": ({"linux", "windows"}, "needs a full game build (work/build/hookshot_game.dll) and Unicorn"),
     # (a GPU)
+    "tests/test_present_aspect_vulkan.py": ({"linux", "windows"}, "needs a Vulkan 1.3 device for offscreen transfer/readback"),
     "nx2/test_bc_storage_views.py": ({"linux", "windows"}, "needs a Windows Vulkan device"),
     # (Linux only)
     "tests/test_appimage_source_headers.py": ({"windows"}, "the AppImage source-copy block uses POSIX Bash and cp"),
     "tests/test_hookshot_launch.py": ({"windows"}, "the Linux launcher, a POSIX shell script"),
     "tests/test_linux_update.py": ({"windows"}, "the Linux builder's update and folder launcher, POSIX files and shell scripts"),
+    "tests/test_linux_menu_font.py": ({"windows"}, "POSIX menu font loader"),
     "tests/test_oot_saves.py": ({"windows"}, "the save script's folder discovery is the Linux one (on Windows Hookshot's saves are in the game folder: --hookshot)"),
     "tests/test_linux_driver_fault_guard.py": ({"windows"}, "POSIX signals: the Linux guard"),
+    "tests/test_linux_menu_utf8.py": ({"windows"}, "POSIX menu text renderer"),
+    "tests/test_menu_font_latin.py": ({"windows"}, "the Linux menu's text: host/posix and fontconfig"),
 }
 # (spirv-val: SPIRV-Tools comes with the Linux runner's packages, not on Windows)
 for _name in ("nx2/test_texture_phi_dominance.py", "nx2/test_unsigned_image_types.py", "nx2/test_depth_sample_types.py", "nx2/test_default_point_size.py", "nx2/test_draw_parameters.py", "nx2/test_coop_spirv.py",
-              "nx2/test_spirv_struct_identity.py"):
+              "nx2/test_spirv_struct_identity.py", "tests/test_mesh_unreachable_outputs.py"):
     SKIP[_name] = ({"windows"}, "needs spirv-val: checked on Linux")
+# (glslang: likewise a Linux runner package. The headers it checks are SPIR-V, the same on every platform)
+SKIP["tests/test_fsr3_shaders.py"] = ({"windows"}, "needs glslang: checked on Linux")
 
 
 def which(*names):
@@ -145,6 +169,7 @@ def find_tools():
         "spirv_headers": header_dir("HOOKSHOT_SPIRV_HEADERS", "spirv-headers", os.path.join("spirv", "unified1", "spirv.h")),
         "vulkan_headers": header_dir("HOOKSHOT_VULKAN_HEADERS", "vulkanheaders", os.path.join("vulkan", "vulkan.h")),
         "spirv_val": which("spirv-val"),
+        "glslang": which("glslangValidator", "glslang"),
         "cxx": which(os.environ.get("CXX", ""), "clang++", "g++", "c++"),
     }
 

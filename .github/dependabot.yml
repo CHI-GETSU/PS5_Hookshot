@@ -1,11 +1,14 @@
 # The actions the workflows use are pinned by commit (the version in a comment beside each): Dependabot proposes the
-# newer ones once a week, pin and comment together.
+# newer ones once a week, pin and comment together. A release is proposed only once it is a week old (cooldown): a
+# compromised action version is usually found and pulled within days, before it reaches these workflows.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns: ['*']

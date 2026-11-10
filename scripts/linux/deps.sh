@@ -6,6 +6,7 @@
 #                     the player's PC compiles the game with them. The play profile (work/hookshot_pieces.prof) wants
 #                     LLVM 23 or newer.
 #   python/           CPython (python-build-standalone) with lz4, numpy, capstone, unicorn and zstandard: the tools
+#                     (and nx2/prompt_requirements.txt's, which draw the button prompts)
 #   tk/               libtcl9tk9.0.so built with Xft, with libXft and libXrender: put over python/'s, which draws only
 #                     X core fonts (under XWayland one 13 px bitmap font, whatever the size asked for or the screen)
 #   ffmpeg/           FFmpeg's libavcodec, libswscale, libswresample, libavutil, static and LGPL, with dav1d for OoT's
@@ -93,15 +94,16 @@ if ! done_for llvm "$LLVM_VER"; then
 fi
 
 # ---- Python and the tools' modules ----
-if ! done_for python "$PY_VER-$PY_TAG"; then
+PY_MARK="$PY_VER-$PY_TAG-$(sha256sum nx2/prompt_requirements.txt | cut -c1-12)"   # (a new pin installs again)
+if ! done_for python "$PY_MARK"; then
     fetch "https://github.com/astral-sh/python-build-standalone/releases/download/$PY_TAG/cpython-$PY_VER+$PY_TAG-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz" python.tar.gz "$PY_SHA256"
     rm -rf "$DEPS/python"
     tar -xzf "$DL/python.tar.gz" -C "$DEPS"
     "$DEPS/python/bin/python3" -m pip install --no-cache-dir --only-binary :all: --disable-pip-version-check -q \
-        "lz4==4.4.5" "numpy==2.5.4" "capstone==5.0.9" "unicorn==2.1.4" "zstandard==0.25.0"
+        "lz4==4.4.5" "numpy==2.5.4" "capstone==5.0.9" "unicorn==2.1.4" "zstandard==0.25.0" -r nx2/prompt_requirements.txt
     rm -rf "$DEPS/python/lib/python3.12/test" "$DEPS/python/lib/python3.12/idlelib" "$DEPS/python/lib/python3.12/ensurepip"
     find "$DEPS/python" -name __pycache__ -prune -exec rm -rf {} +
-    mark python "$PY_VER-$PY_TAG"
+    mark python "$PY_MARK"
 fi
 
 # ---- Tk with Xft (the builder window's fonts; Tcl is built only for Tk's configure and stub library) ----

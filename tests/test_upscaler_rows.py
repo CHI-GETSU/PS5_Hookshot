@@ -1,6 +1,6 @@
-"""The Insert menu's scaling rows: the Upscaler (opts.dlss) and the Render resolution's steps for it (gpu/vk/upscaler_rows.h),
-their order on the Graphics tab, options files from before still loading, and their help (why DLSS is not offered, the
-Sharpness DLSS wants). No game or GPU required.
+"""The Insert menu's scaling rows: the Upscaler (opts.dlss: the game's own, DLSS, DLAA, AMD FSR 3.1) and the Render resolution's
+steps for it (gpu/vk/upscaler_rows.h), their order on the Graphics tab, options files from before still loading, and their
+help (why DLSS is not offered, the Sharpness DLSS wants). No game or GPU required.
 
 python -I -B tests/test_upscaler_rows.py [--cxx g++]
 """
@@ -47,7 +47,7 @@ def main():
     # the menu's rules are upscaler_rows.h's, checked by behaviour in test_upscaler_rows.cpp: here only that the menu uses them
     uses = {
         "row_fixed": ("ur::upscaler_fixed(", "ur::resolution_fixed(", "reflex_available()", "ur::model_fixed("),
-        "row_shown": ("ur::upscaler_shown(dlss_built())", "ur::model_shown(dlss_built())"),
+        "row_shown": ("ur::upscaler_shown(dlss_built(), fsr3::supported())", "ur::model_shown(dlss_built())"),
         "set_row": ("ur::step_upscaler(", "ur::step(", "ur::snap(", "row_fixed("),
     }
     for name, calls in uses.items():
@@ -94,6 +94,13 @@ def main():
         raise SystemExit("vk_dlss.cpp: the DLSS model row (and RX_VK_DLSS_PRESET over it) is not the preset asked for")
     if "dlss_why() != DLSS_OK" not in function(dlss, "int dlss_mode() {"):
         raise SystemExit("dlss_mode asks for DLSS where it cannot run (DLAA would hold the 3D at full scale for nothing)")
+    if "std::clamp(" in function(dlss, "int dlss_mode() {"):
+        raise SystemExit("dlss_mode clamps the row's value: FSR 3.1 (3) would run DLAA")
+    # FSR 3.1 is offered where it runs, and the row steps over what does not run here
+    if "fsr3::supported()" not in function(menu, "unsigned upscalers_available() {"):
+        raise SystemExit("upscalers_available does not ask vk_fsr3.cpp whether FSR 3.1 runs here")
+    if "upscalers_available()" not in function(menu, "void set_row(") or "upscalers_available()" not in function(menu, "bool row_fixed("):
+        raise SystemExit("the Upscaler row does not step over (or fix on) what runs here")
     with tempfile.TemporaryDirectory(prefix="upscaler-rows-") as tmp:
         exe = Path(tmp) / "upscaler-rows"
         subprocess.run([args.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror",

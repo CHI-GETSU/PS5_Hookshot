@@ -25,6 +25,15 @@ void EmitBarrier(EmitContext& ctx) {
                          ctx.Const(static_cast<u32>(memory_semantics)));
 }
 
+// (hookshot) The subgroup's invocations meet, and their workgroup (shared) memory accesses before it are visible to the ones after:
+// what the Switch's in-order warp gives a warp's stores and LDSM's reads of them without a BAR
+void EmitSubgroupBarrier(EmitContext& ctx) {
+    const auto scope{spv::Scope::Subgroup};
+    const auto memory_semantics{spv::MemorySemanticsMask::AcquireRelease | spv::MemorySemanticsMask::WorkgroupMemory};
+    ctx.OpControlBarrier(ctx.Const(static_cast<u32>(scope)), ctx.Const(static_cast<u32>(scope)),
+                         ctx.Const(static_cast<u32>(memory_semantics)));
+}
+
 void EmitWorkgroupMemoryBarrier(EmitContext& ctx) {
     MemoryBarrier(ctx, spv::Scope::Workgroup);
 }

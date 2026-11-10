@@ -250,7 +250,7 @@ class Builder(tk.Tk):
         ttk.Checkbutton(f, text="Prepare shaders now (unticked: at the game's first start, behind a black window)",
                         variable=self.prepare).grid(row=row, column=0, columnspan=3, sticky="w", **self.pad)
         row += 1
-        ttk.Label(f, text="Takes about 45 minutes and needs 60 GB.").grid(row=row, column=0, columnspan=3, sticky="w", **self.pad)
+        ttk.Label(f, text="Takes about 45 minutes and needs 45 GB.").grid(row=row, column=0, columnspan=3, sticky="w", **self.pad)
         row += 1
         ttk.Label(f, textvariable=self.space_text).grid(row=row, column=0, columnspan=3, sticky="w", **self.pad)
         row += 1

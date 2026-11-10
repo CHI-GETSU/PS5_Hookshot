@@ -1,6 +1,6 @@
 # Hookshot (oot-recomp): design
 
-A native x86-64 Windows build of the Switch 2 *The Legend of Zelda: Ocarina of Time* remake: the game's AArch64
+A native x86-64 Windows and Linux build of the Switch 2 *The Legend of Zelda: Ocarina of Time* remake: the game's AArch64
 code translated to C ahead of time from the user's own decrypted dump and compiled with clang, the Horizon OS and
 NVN2 implemented natively, and the GPU work replayed on Vulkan. No CPU or GPU emulation at any point: the same
 model as mkw-recomp (Mario Kart World), which this project forks.
@@ -64,10 +64,10 @@ message. OoT-specific code goes into new files where it can, so the shared files
         │  a64-kit lift/a64_lift.py + nx2/insn.py + nx2/lift_fixes.py + nx2/poll.py + nx2/chunks.py
         ▼
  one C function per guest function (work/sa/gen, ~1 GB, local), 64-bit guest window (nx2/rtgen.py)
-        │  clang 24 (emsdk) -O1, lld (nx2/build.py --standalone)
+        │  clang (llvm-mingw, emsdk or the system's) -O1, the hot functions -O2 with the play profile, lld (nx2/build.py --standalone)
         ▼
  hookshot.exe = lifted game + host/ (Horizon: threads, SVCs, memory, fs, hid, audio, vi, gs, NVN2)
- hookshot_vk.dll = the Vulkan back end (gpu/vk), loaded by host/rx_backend.c with RX_BACKEND=vulkan
+ hookshot_vk.dll = the Vulkan back end (gpu/vk), loaded by host/rx_backend.c unless RX_BACKEND names another renderer
 ```
 
 - **Standalone from the start.** MKW went emulator-hosted first (Eglantine with a recompiled CPU backend), then
@@ -81,8 +81,8 @@ message. OoT-specific code goes into new files where it can, so the shared files
 - **GPU.** `host/nvn_native.c` implements the NVN2 procs over guest memory in place: objects live where the game
   puts them, command buffers record an op stream (`gpu/render/rx_nvn.h`), queue submits hand it to the back end.
   `gpu/vk` replays it on Vulkan 1.3: pools imported as host memory, SM86 programs through Eden's recompiler to
-  SPIR-V, mesh/task programs with `VK_EXT_mesh_shader`. The WebGPU renderer (`gpu/render`) stays in the exe as the
-  fallback when Vulkan is missing, as in mkw-recomp.
+  SPIR-V, mesh/task programs with `VK_EXT_mesh_shader`. The WebGPU renderer (`gpu/render`) stays in the Windows exe as the
+  fallback when Vulkan is missing, as in mkw-recomp, when the build has wgpu-native (`WGPU_NATIVE`).
 
 ## 4. The lessons from MKW, as rules here
 
@@ -98,14 +98,17 @@ second game.
    (`gpu/vk/vk_memory.cpp`, `RX_VK_CAPTURE_POOL_MB`). *Check:* the mirror sync log's live-sync count stays ~0.
 3. **Texture and sampler registrations are queued in order with the submits**, never applied out of band.
 4. **GPU timestamps drive dynamic resolution.** OoT is reported at 1080p-1440p docked, so it has a resolution
-   controller fed by timestamp reports: the fake GPU time (`host/nvn_native.c`, the 31.25 MHz tick clock) must be
+   controller fed by timestamp reports: the fake GPU time (the counter reports the replay writes, `gpu/vk/vk_replay.cpp`
+   `NOP_REPORT_COUNTER`: the 31.25 MHz tick clock since the frame's present, times `RX_VK_TS_SCALE`, 0.1 by default) must be
    scaled so the controller settles where the PC is, not at its floor. *Check:* the render size it picks over time.
-5. **Clears after draws, and draws that sample their own target, get passes of their own** (`vk_draw.cpp`).
+5. **Clears after draws, and draws that sample a target their pass already wrote (or write one an earlier draw of the
+   pass sampled), get passes of their own** (`vk_draw.cpp` `clear_after_draws`, `draw_hazards`). A draw that samples
+   a target it writes itself stays in the pass.
 6. **2D views of 3D textures need `VK_EXT_image_2d_view_of_3d`** (the RTX 4060 Ti has it).
 7. **The CPU saturates first.** Ryzen 5 7600X, 6 cores / 12 threads: the game's threads, the replay, captures and
    pipeline compiles share it, and extra helper threads have lowered fps before. Thread counts are measured, never
-   raised by default (`HOS_VCORES`, `RX_VK_CAPTURE_THREADS`, `HOS_THREAD_STATS=1`, the `HOS_SAMPLE` profiler with
-   `scripts/prof.py`).
+   raised by default (`HOS_VCORES`, `RX_VK_CAPTURE_THREADS`, `HOS_THREAD_TIMES=<seconds>`, the `HOS_SAMPLE` profiler
+   with `scripts/prof.py`).
 
 Also inherited, and game-specific in MKW: MKW's frame-pacer hooks at fixed guest addresses are gated on MKW's build
 id (`hos_game_is_mkw`); OoT gets its own once its pacer is found, never by address coincidence.
@@ -155,7 +158,7 @@ id (`hos_game_is_mkw`); OoT gets its own once its pacer is found, never by addre
   edited.
 - One game run at a time on this PC (mkw-recomp's runs take ~10 GB): `run-vk.ps1` refuses while `mkw.exe` or
   another `hookshot.exe` runs, and while Rainbow Six Siege is open; no heavy builds while Siege is open either. Runs are
-  muted (`HOS_AUDIO=0`), at below-normal priority, and screenshot folders are deleted once looked at.
+  muted (`HOS_AUDIO=0`), at the priority `-Priority` gives (High by default), and screenshot folders are deleted once looked at.
 - The lifted C and every build are GPL (suyu's translator is GPL-2.0-or-later; Eden's code is GPL-3.0).
 
 ## 9. Status

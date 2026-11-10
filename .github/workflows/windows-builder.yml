@@ -112,7 +112,8 @@ jobs:
       - name: Package folder
         run: >-
           python -I scripts/release_parts.py package "$RUNNER_TEMP/package"
-          --publish "$RUNNER_TEMP/publish" --setup "$RUNNER_TEMP/HookshotBuilder-Setup.exe" ${PREVIOUS:+--list "$PREVIOUS"}
+          --publish "$RUNNER_TEMP/publish" --setup "$RUNNER_TEMP/HookshotBuilder-Setup.exe"
+          ${PREVIOUS:+--list "$PREVIOUS" --python-packages nx2/prompt_requirements.txt}
 
       - name: Setup parts
         run: |

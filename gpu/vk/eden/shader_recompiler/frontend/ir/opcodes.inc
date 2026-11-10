@@ -23,6 +23,7 @@ OPCODE(EndPrimitive,                                        Void,           U32,
 // Barriers
 OPCODE(Barrier,                                             Void,                                                                                           )
 OPCODE(WorkgroupMemoryBarrier,                              Void,                                                                                           )
+OPCODE(SubgroupBarrier,                                     Void,                                                                                           )
 OPCODE(DeviceMemoryBarrier,                                 Void,                                                                                           )
 
 // Context getters/setters

@@ -43,7 +43,7 @@ def release(root=ROOT):
 
 
 def fingerprint(root=ROOT):
-    h = hashlib.sha1()
+    h = hashlib.sha1(usedforsecurity=False)
     for top in SOURCES:
         base = os.path.join(root, top)
         for d, dirs, files in os.walk(base):

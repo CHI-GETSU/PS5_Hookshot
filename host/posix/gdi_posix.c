@@ -4,6 +4,7 @@
 #define _GNU_SOURCE
 #include <windows.h>
 
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #define STB_TRUETYPE_IMPLEMENTATION
@@ -33,23 +34,33 @@ static unsigned char *read_all(const char *path) {
     fclose(f);
     return d;
 }
-static int face_load(Face *face, const char *path) {
+static int face_load(Face *face, const char *path, int index) {
     unsigned char *d = read_all(path);
     if (!d) return 0;
-    const int off = stbtt_GetFontOffsetForIndex(d, 0);
-    if (off < 0 || !stbtt_InitFont(&face->info, d, off)) { free(d); return 0; }
+    const int off = stbtt_GetFontOffsetForIndex(d, index);
+    /* (issue 1279: a font with no Latin letters, such as fontconfig's sans-serif on some systems, drew every letter as
+       its empty box (.notdef, glyph 0): such a font is passed over for the next one) */
+    if (off < 0 || !stbtt_InitFont(&face->info, d, off) || !stbtt_FindGlyphIndex(&face->info, 'A')) { free(d); return 0; }
     face->data = d, face->ok = 1;
     return 1;
 }
-static int fc_match(const char *pattern, char *out, size_t cap) {
-    char cmd[256];
-    snprintf(cmd, sizeof cmd, "fc-match -f '%%{file}' '%s' 2>/dev/null", pattern);
+static void face_match(Face *face, const char *pattern) {
+    char cmd[256], path[4096], index[32];
+    snprintf(cmd, sizeof cmd, "fc-match -f '%%{index}\\n%%{file}' '%s' 2>/dev/null", pattern);
     FILE *p = popen(cmd, "r");
-    if (!p) return 0;
-    const size_t n = fread(out, 1, cap - 1, p);
-    pclose(p);
-    out[n] = 0;
-    return n > 0;
+    if (!p) return;
+    if (!fgets(index, sizeof index, p)) {
+        pclose(p);
+        return;
+    }
+    const size_t n = fread(path, 1, sizeof path - 1, p);
+    if (pclose(p) != 0 || !n) return;
+    char *end;
+    const unsigned long selected = strtoul(index, &end, 10);
+    if (end == index || *end != '\n' || selected > INT_MAX) return;
+    path[n] = 0;
+    /* Fontconfig packs variable-font instances in the upper bits; stb needs the collection face. */
+    face_load(face, path, (int)(selected & 0xffff));
 }
 static void faces_load(void) {
     static const char *regular[] = {"/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -68,14 +79,15 @@ static void faces_load(void) {
     char *slash = strrchr(path, '/');
     if (slash) {
         snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "fonts/regular.ttf");
-        face_load(&faces[0], path);
+        face_load(&faces[0], path, 0);
         snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "fonts/bold.ttf");
-        face_load(&faces[1], path);
+        face_load(&faces[1], path, 0);
     }
-    if (!faces[0].ok && fc_match("sans-serif", path, sizeof path)) face_load(&faces[0], path);
-    if (!faces[1].ok && fc_match("sans-serif:bold", path, sizeof path)) face_load(&faces[1], path);
-    for (size_t i = 0; !faces[0].ok && i < sizeof regular / sizeof *regular; i++) face_load(&faces[0], regular[i]);
-    for (size_t i = 0; !faces[1].ok && i < sizeof bold / sizeof *bold; i++) face_load(&faces[1], bold[i]);
+    /* (lang=en: fontconfig's choice among the fonts that have the menu's letters) */
+    if (!faces[0].ok) face_match(&faces[0], "sans-serif:lang=en");
+    if (!faces[1].ok) face_match(&faces[1], "sans-serif:bold:lang=en");
+    for (size_t i = 0; !faces[0].ok && i < sizeof regular / sizeof *regular; i++) face_load(&faces[0], regular[i], 0);
+    for (size_t i = 0; !faces[1].ok && i < sizeof bold / sizeof *bold; i++) face_load(&faces[1], bold[i], 0);
     if (!faces[1].ok && faces[0].ok) faces[1] = faces[0];
     if (!faces[0].ok && faces[1].ok) faces[0] = faces[1];
     if (!faces[0].ok) fprintf(stderr, "[vk] no font found (fontconfig's sans-serif): the Insert menu has no text\n");
@@ -169,15 +181,39 @@ UINT SetTextAlign(HDC hdc, UINT align) {
 }
 
 /* ---- text ---- */
+static int text_codepoint(const unsigned char **text, const unsigned char *end) {
+    const unsigned char *p = *text;
+    const unsigned lead = *p++;
+    *text = p;
+    if (lead < 0x80) return lead;
+    if (lead < 0xc2 || lead > 0xf4) return 0xfffd;
+    const int extra = lead < 0xe0 ? 1 : lead < 0xf0 ? 2 : 3;
+    if (end - p < extra) return 0xfffd;
+
+    unsigned cp = lead & (0x7f >> (extra + 1));
+    for (int i = 0; i < extra; i++) {
+        if ((p[i] & 0xc0) != 0x80) return 0xfffd;
+        cp = cp << 6 | (p[i] & 0x3f);
+    }
+    static const unsigned minimum[] = {0, 0x80, 0x800, 0x10000};
+    if (cp < minimum[extra] || (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff) return 0xfffd;
+    *text = p + extra;
+    return (int)cp;
+}
 static float scale_of(Face *face, const GFont *f) { return stbtt_ScaleForMappingEmToPixels(&face->info, (float)(f ? f->px : 16)); }
 static int text_width(Face *face, const GFont *f, LPCSTR s, int n) {
+    if (n <= 0) return 0;
     const float sc = scale_of(face, f);
     float w = 0;
-    for (int i = 0; i < n; i++) {
+    int previous = -1;
+    const unsigned char *p = (const unsigned char *)s, *end = p + n;
+    while (p < end) {
+        const int cp = text_codepoint(&p, end);
+        if (previous >= 0) w += sc * stbtt_GetCodepointKernAdvance(&face->info, previous, cp);
         int adv, lsb;
-        stbtt_GetCodepointHMetrics(&face->info, (unsigned char)s[i], &adv, &lsb);
+        stbtt_GetCodepointHMetrics(&face->info, cp, &adv, &lsb);
         w += adv * sc;
-        if (i + 1 < n) w += sc * stbtt_GetCodepointKernAdvance(&face->info, (unsigned char)s[i], (unsigned char)s[i + 1]);
+        previous = cp;
     }
     return (int)ceilf(w);
 }
@@ -206,8 +242,11 @@ BOOL TextOutA(HDC hdc, int x, int y, LPCSTR s, int n) {
     const int aa = !d->font || d->font->aa;
     const uint32_t tr = d->text & 0xFF, tg = d->text >> 8 & 0xFF, tb = d->text >> 16 & 0xFF;
     float pen = (float)x;
-    for (int i = 0; i < n; i++) {
-        const int cp = (unsigned char)s[i];
+    int previous = -1;
+    const unsigned char *cursor = (const unsigned char *)s, *end = cursor + n;
+    while (cursor < end) {
+        const int cp = text_codepoint(&cursor, end);
+        if (previous >= 0) pen += sc * stbtt_GetCodepointKernAdvance(&face->info, previous, cp);
         int adv, lsb, x0, y0, x1, y1;
         stbtt_GetCodepointHMetrics(&face->info, cp, &adv, &lsb);
         const float sub = pen - floorf(pen);
@@ -235,7 +274,7 @@ BOOL TextOutA(HDC hdc, int x, int y, LPCSTR s, int n) {
             free(g);
         }
         pen += adv * sc;
-        if (i + 1 < n) pen += sc * stbtt_GetCodepointKernAdvance(&face->info, cp, (unsigned char)s[i + 1]);
+        previous = cp;
     }
     return TRUE;
 }

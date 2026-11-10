@@ -58,23 +58,13 @@ class NgxRuntimeTests(unittest.TestCase):
         with mock.patch.object(make_game, "LINUX", platform == "linux"), mock.patch.dict(os.environ, env):
             return make_game.ngx_built()
 
-    def test_jitter_only_in_a_build_with_the_sdk(self):
-        # (make_game sets OOT_DLSS_JITTER=1 for the lift only then: nx2/oot_jitter.py)
+    def test_built_with_this_platforms_library(self):
+        # (the camera jitter is no longer tied to this: nx2/oot_jitter.py is in every standalone lift, for FSR 3.1 as well)
         self.assertFalse(self.built("linux", sdk=""))
         self.assertFalse(self.built("linux"))   # (no library yet)
         self.sdk_files("linux", runtime=False)
         self.assertTrue(self.built("linux"))
         self.assertFalse(self.built("windows"))   # (another platform's library only)
-        import sys
-        sys.path.insert(0, str(ROOT / "nx2"))
-        try:
-            import oot_jitter
-        finally:
-            sys.path.pop(0)
-        with mock.patch.dict(os.environ, {"OOT_DLSS_JITTER": "1"}):
-            self.assertTrue(oot_jitter.wanted())
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(oot_jitter.wanted())
 
     def test_linux_runtime(self):
         self.sdk_files("linux")

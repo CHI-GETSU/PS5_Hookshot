@@ -148,8 +148,13 @@ void hos_update_check(void) {
         ShellExecuteW(NULL, L"open", RELEASES_PAGE, NULL, NULL, SW_SHOWNORMAL);
         return;
     }
-    wchar_t args[MAX_PATH + 256], wdir[MAX_PATH];
-    _snwprintf(args, MAX_PATH + 256, L"--update \"%ls\" --tag \"%ls\"", dir, wtag);
+    /* (the Python builder: builder= is its pythonw.exe, and builder_args= what goes before --update, its start script) */
+    char bargs[1024] = "";
+    wchar_t wbargs[1024] = L"";
+    _snwprintf(file, MAX_PATH + 64, L"%ls\\hookshot_version.txt", dir);
+    if (read_value(file, "builder_args", bargs, sizeof bargs)) MultiByteToWideChar(CP_UTF8, 0, bargs, -1, wbargs, 1024);
+    wchar_t args[MAX_PATH + 1280], wdir[MAX_PATH];
+    _snwprintf(args, MAX_PATH + 1280, L"%ls%ls--update \"%ls\" --tag \"%ls\"", wbargs, wbargs[0] ? L" " : L"", dir, wtag);
     wcsncpy(wdir, wbuilder, MAX_PATH);
     wdir[MAX_PATH - 1] = 0;
     wchar_t *slash = wcsrchr(wdir, L'\\');

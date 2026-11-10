@@ -280,11 +280,47 @@ static int wait_until(Obj *o, int64_t deadline) {
 static SRWLOCK mw_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE mw_cv = CONDITION_VARIABLE_INIT;
 static volatile LONG mw_waiting;
-static void poke_multiwait(void) {
+/* The guest addresses linked holders watch (events, timers, semaphores, queues), each with how many holders watch it.
+   Kept by address under mw_lock, not on the Obj: objects are re-initialized and their memory reused by address (fresh,
+   the tombstone path in obj_lookup) while holders still link them, and Link/Unlink never look the target up. */
+typedef struct { uint64_t key; int n; } MwWatched;
+static MwWatched *mw_watched;
+static int mw_nwatched, mw_capwatched;
+static int mw_watch_incomplete;   /* failed registration: keep old global wakes for this process */
+static int mw_watched_at_locked(uint64_t key) {
+    for (int i = 0; i < mw_nwatched; i++)
+        if (mw_watched[i].key == key) return i;
+    return -1;
+}
+static void mw_watch_add_locked(uint64_t key) {
+    const int i = mw_watched_at_locked(key);
+    if (i >= 0) { mw_watched[i].n++; return; }
+    if (mw_nwatched == mw_capwatched) {
+        MwWatched *w = (MwWatched *)realloc(mw_watched, (mw_capwatched ? mw_capwatched * 2 : 16) * sizeof *w);
+        if (!w) { mw_watch_incomplete = 1; return; }
+        mw_watched = w;
+        mw_capwatched = mw_capwatched ? mw_capwatched * 2 : 16;
+    }
+    mw_watched[mw_nwatched].key = key, mw_watched[mw_nwatched].n = 1;
+    mw_nwatched++;
+}
+static void mw_watch_remove_locked(uint64_t key) {
+    const int i = mw_watched_at_locked(key);
+    if (i >= 0 && --mw_watched[i].n <= 0) mw_watched[i] = mw_watched[--mw_nwatched];
+}
+/* o: the object that changed. Only an object some holder links into a multi-wait can make a WaitAny ready, so the
+   others no longer wake every WaitAny: each event, semaphore or queue change anywhere woke them all, and OoT's three
+   nn.npln threads (offline: their own events never set) woke ~8,500 times a second each to sleep again, 57% of the game's
+   context switches. The check is under mw_lock, as Link and WaitAny's scan are: a link before it is seen here, one after
+   it is followed by a scan that sees the stored state. HOS_MW_WAKE=all: every change, as before */
+static void poke_multiwait(Obj *o) {
+    static int all = -1;
+    if (all < 0) all = getenv("HOS_MW_WAKE") && !strcmp(getenv("HOS_MW_WAKE"), "all");
     if (!InterlockedCompareExchange(&mw_waiting, 0, 0)) return;
     AcquireSRWLockExclusive(&mw_lock);
+    const int wake = all || mw_watch_incomplete || !o || mw_watched_at_locked(o->key) >= 0;
     ReleaseSRWLockExclusive(&mw_lock);
-    WakeAllConditionVariable(&mw_cv);
+    if (wake) WakeAllConditionVariable(&mw_cv);
 }
 
 #if (defined(__x86_64__) || defined(_M_X64)) && !defined(__EMSCRIPTEN__)
@@ -576,7 +612,7 @@ static void event_signal(Obj *e) {
     if (wake_lat_on()) e->sig_ns = hos_now_ns();
     ReleaseSRWLockExclusive(&e->lk);
     WakeAllConditionVariable(&e->cv);
-    poke_multiwait();
+    poke_multiwait(e);
 }
 static void event_clear(Obj *e) {
     AcquireSRWLockExclusive(&e->lk);
@@ -811,7 +847,7 @@ HLE(_ZN2nn2os23StartPeriodicTimerEventEPNS0_14TimerEventTypeENS_8TimeSpanES3_) {
     t->signaled = 0;
     ReleaseSRWLockExclusive(&t->lk);
     WakeAllConditionVariable(&t->cv);   /* (a first wait that beat this start sleeps on the cv) */
-    poke_multiwait();
+    poke_multiwait(t);
 }
 HLE(_ZN2nn2os14WaitTimerEventEPNS0_14TimerEventTypeE) {
     Obj *t = obj(ARG(0), K_TIMER);
@@ -848,7 +884,7 @@ static void sema_release(Obj *s, int n) {
     if (s->sem_max && s->sem > s->sem_max) s->sem = s->sem_max;
     ReleaseSRWLockExclusive(&s->lk);
     WakeAllConditionVariable(&s->cv);
-    poke_multiwait();
+    poke_multiwait(s);
 }
 HLE(_ZN2nn2os19InitializeSemaphoreEPNS0_13SemaphoreTypeEii) { sema_init(ARG(0), (int)ARG(1), (int)ARG(2)); }
 HLE(_ZN2nn2os17FinalizeSemaphoreEPNS0_13SemaphoreTypeE) { drop(ARG(0)); }
@@ -895,7 +931,7 @@ static int queue_put(Obj *q, uint64_t v, int jam, int try_only) {
     if (wake_lat_on()) q->sig_ns = hos_now_ns();
     ReleaseSRWLockExclusive(&q->lk);
     WakeAllConditionVariable(&q->cv);
-    poke_multiwait();
+    poke_multiwait(q);
     return 1;
 }
 /* take: remove it; timeout_ns: < 0 forever, 0 try, > 0 timed. Returns 1 if a value was read. */
@@ -920,7 +956,7 @@ static int queue_get(Obj *q, uint64_t *out, int take, int64_t timeout_ns) {
     ReleaseSRWLockExclusive(&q->lk);
     if (take) {
         WakeAllConditionVariable(&q->cv);
-        poke_multiwait();
+        poke_multiwait(q);
     }
     return 1;
 }
@@ -1035,6 +1071,11 @@ static int holder_ready(Obj *h) {
     default: return 0;         /* native handles: never, without a kernel behind them */
     }
 }
+/* The guest address a holder watches, whose changes poke WaitAny (poke_multiwait); 0: threads and native handles, never
+   ready. The address alone: no object lookup (Unlink runs at teardown, often after the object was finalized) */
+static uint64_t holder_watch(const Obj *h) {
+    return h->sem_max == H_THREAD || h->sem_max == H_NATIVE ? 0 : h->event;
+}
 HLE(_ZN2nn2os19InitializeMultiWaitEPNS0_13MultiWaitTypeE) { fresh(ARG(0), K_MULTIWAIT); }
 HLE(_ZN2nn2os17FinalizeMultiWaitEPNS0_13MultiWaitTypeE) { drop(ARG(0)); }
 HLE(_ZN2nn2os25InitializeMultiWaitHolderEPNS0_19MultiWaitHolderTypeEPNS0_9EventTypeE) { holder(c, H_EVENT); }
@@ -1058,14 +1099,17 @@ HLE(_ZN2nn2os19LinkMultiWaitHolderEPNS0_13MultiWaitTypeEPNS0_19MultiWaitHolderTy
     }
     mw->links[mw->nlinks++] = h;
     h->mw = mw;
+    if (holder_watch(h)) mw_watch_add_locked(holder_watch(h));
     ReleaseSRWLockExclusive(&mw_lock);
 }
 HLE(_ZN2nn2os21UnlinkMultiWaitHolderEPNS0_19MultiWaitHolderTypeE) {
     Obj *h = obj(ARG(0), K_HOLDER), *mw = h->mw;
     AcquireSRWLockExclusive(&mw_lock);
-    if (mw)
+    if (mw) {
         for (int i = 0; i < mw->nlinks; i++)
             if (mw->links[i] == h) { mw->links[i] = mw->links[--mw->nlinks]; break; }
+        if (holder_watch(h)) mw_watch_remove_locked(holder_watch(h));
+    }
     h->mw = NULL;
     ReleaseSRWLockExclusive(&mw_lock);
 }
@@ -1102,7 +1146,10 @@ HLE(_ZN2nn2os10TryWaitAnyEPNS0_13MultiWaitTypeE) { RET(wait_any(ARG(0), 0)); }
 HLE(_ZN2nn2os24UnlinkAllMultiWaitHolderEPNS0_13MultiWaitTypeE) {
     Obj *mw = obj(ARG(0), K_MULTIWAIT);
     AcquireSRWLockExclusive(&mw_lock);
-    for (int i = 0; i < mw->nlinks; i++) mw->links[i]->mw = NULL;
+    for (int i = 0; i < mw->nlinks; i++) {
+        if (holder_watch(mw->links[i])) mw_watch_remove_locked(holder_watch(mw->links[i]));
+        mw->links[i]->mw = NULL;
+    }
     mw->nlinks = 0;
     ReleaseSRWLockExclusive(&mw_lock);
 }
@@ -1206,7 +1253,7 @@ HLE(_ZN2nn2os22StartOneShotTimerEventEPNS0_14TimerEventTypeENS_8TimeSpanE) {
     t->signaled = 0;
     ReleaseSRWLockExclusive(&t->lk);
     WakeAllConditionVariable(&t->cv);
-    poke_multiwait();
+    poke_multiwait(t);
 }
 /* GenerateRandomBytes(void*, size_t) */
 HLE(_ZN2nn2os19GenerateRandomBytesEPvm) {

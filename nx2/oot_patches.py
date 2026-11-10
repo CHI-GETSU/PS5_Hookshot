@@ -20,6 +20,7 @@ Each is a runtime switch where it can be, so the game's own path stays reachable
 import glob
 import os
 import sys
+import whole_write   # (rewrites written beside and moved over: issue 1197)
 
 DECL = "extern volatile int hos_fixed_resolution;\nextern volatile int hos_dynres_runs;\nextern volatile uint32_t hos_fixed_scale_bits;\n"
 OLD = "if (!((c->x[8] >> 0) & 1)) { goto L_8082640c; }"
@@ -240,8 +241,7 @@ def apply(gen, *, protect_hearts=False, required=False):
             done["free camera"] += 1
             print("oot_patches: free camera in", os.path.basename(path))
         if out != s:
-            with open(path, "w", encoding="utf-8", newline="") as f:
-                f.write(out)
+            whole_write.write_whole(path, out, newline="")
     for what, n in done.items():
         if n != 1:
             print("oot_patches: WARNING: the %s was found %d times" % (what, n))
@@ -329,8 +329,7 @@ def apply_output_size(gen, required=False):
         if hit:
             if OUT_DECL not in s:
                 s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + OUT_DECL, 1)
-            with open(path, "w", encoding="utf-8", newline="") as f:
-                f.write(s)
+            whole_write.write_whole(path, s, newline="")
             print("oot_patches: output size in", os.path.basename(path))
     if found != [1] * len(OUT_EDITS):
         if required:

@@ -34,7 +34,7 @@ def main():
     create = body.index("guarded_compute(")
     if check < 0 or not lock < check < create:
         raise SystemExit("a program that failed is compiled again: the check must come under the lock, before guarded_compute")
-    failure = block(body, "if (guarded_compute(pcache, &ci, &made[i]) != VK_SUCCESS) {")
+    failure = block(body, "&made[i]); r != VK_SUCCESS) {")
     if "failed.insert({p.key, p.variant});" not in failure:
         raise SystemExit("a failed compute pipeline is not remembered")
     if failure.index("failed.insert") > failure.index("return false;"):

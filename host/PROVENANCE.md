@@ -21,11 +21,13 @@ mkw-recomp's changes:
   running its nvnDeviceGetInteger under Unicorn), GPU addresses over the 64-bit window (identity below 1 TB, virtual
   pools above), program builders, native images, sparse tile layouts; procs it lacks log their first call and answer
   0 (`HOS_NVN_STRICT=1`: stop, as in TOTKPort). `display.c` is TOTKPort's window without its emulated-GPU fallback.
-  The replay is `gpu/render` (see `gpu/PROVENANCE.md`). `nn_vi.c` is MKW's own, with the window's frame pacing.
+  The replay was `gpu/render` (see `gpu/PROVENANCE.md`); it is the Vulkan back end in `gpu/vk` now, with `gpu/render`
+  as the fallback (`host/rx_backend.c`). `nn_vi.c` is MKW's own, with the window's frame pacing.
 - **Virtual cores** (`hos_thread.c`): on by default with six cores; a waiter's request reaches a holder at its next
   loop header too (`mkw_glue.c` `a64_poll`), and equal-priority holders yield after a 2 ms slice.
 - **Left out:** files bound to TOTK or its Maxwell GPU: `gpu.c`, `nvn_trace.c`, `hos_prof.c`, `mods.c`, `movie*.c`,
-  `nn_image_debug.c`, `totk_*.c`. `mkw_glue.c` stands in for the hooks the taken files call into them.
+  `nn_image_debug.c`, `totk_*.c`. `mkw_glue.c` stands in for the hooks the taken files call into them. `mods.c`
+  came back later as Hookshot's `host/mods.c`: the RomFS part of Skybound's loader (`NotRexed/SkyboundTotk`, MIT).
 
 Licensing follows a64-kit: GPL, through suyu's translator in the lifted code (see
 `third_party/a64-kit/NOTICE.TOTKPort.md`).

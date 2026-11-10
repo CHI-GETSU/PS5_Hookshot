@@ -29,7 +29,7 @@ game data, leave it out.
 
 | | What |
 |---|---|
-| **Test on other hardware** | The project has been tested on one Windows PC (Ryzen 5 7600X, RTX 4060 Ti) and one Linux PC so far. Reports from AMD and Intel cards, other NVIDIA drivers, other distributions and SteamOS are useful even when everything works. |
+| **Test on other hardware** | NVIDIA cards are the most tested; the README's [status table](readme.md#project-status) says what works where. Reports from AMD and Intel cards, other NVIDIA drivers, other distributions and SteamOS are useful even when everything works. |
 | **Play further** | The tested area is the start of the game. Reaching new areas, cutscenes, menus and items finds problems the developer has not seen. |
 | **Report what is broken** | Use the [issue forms](https://github.com/NotRexed/Hookshot/issues/new/choose): game problem, build problem or idea. Include the version, your hardware, where you were and `hookshot_log.txt`. |
 | **Send a fix** | Fork, fix, test, open a pull request. Small, focused changes are easiest to review and merge. |
@@ -58,19 +58,24 @@ about 10 GB of RAM.
 
    ```powershell
    python -m pip install lz4 numpy capstone "unicorn>=2.1,<2.2" zstandard
+   python -m pip install -r nx2/prompt_requirements.txt
    ```
+
+   (the second line: the button prompts' packages. Without them the game shows the Switch's icons)
 
 2. Get [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) (the `ucrt-x86_64` build) and set `HOOKSHOT_MINGW` to its
    folder. Without it the build falls back to emsdk's clang at `C:\emsdk` with Visual Studio's C++ tools and the
    Windows SDK (`HOOKSHOT_MSVC=1` forces that route).
 
-3. Copy the pieces a clone does not carry from the `tools` folder of the latest `HookshotBuilder.zip`:
+3. Copy the pieces a clone does not carry from the `tools` folder Hookshot Builder installs. Run `HookshotBuilder.exe`
+   from the latest release once (releases no longer carry a `HookshotBuilder.zip`): the folder is
+   `%LOCALAPPDATA%\HookshotBuilder\versions\<version>\HookshotBuilder\tools`.
 
-   | From the zip | To | Variable |
+   | From `tools` | To | Variable |
    |---|---|---|
    | `tools\cpm` | anywhere | `RX_CPM` points at it (Vulkan headers and FFmpeg; without it the Vulkan renderer is left out) |
-   | `tools\wgpu-native` | anywhere | `WGPU_NATIVE` points at it |
-   | `tools\third_party\sdl2\SDL2.dll` | `third_party\sdl2\` | |
+   | `tools\wgpu-native` | anywhere | `WGPU_NATIVE` points at it (the WebGPU fallback renderer; without it the game is built without one) |
+   | `tools\third_party` | `third_party\` | (its `.dll`, `.exe`, `.lib` and `.sha1` files, to the same places: `a64emit`, `lld-link`, `zbic` and SDL2) |
    | `tools\work` | `work\` | (hot-function list, link order, profile and icon; without it the game builds but runs slower) |
 
 4. Run everything with `python -I` from the repository root.
@@ -141,7 +146,7 @@ window, including one started to update a game, uses Automatic again.
 | `python -I nx2/lift.py --standalone --write` | Lift the game to C in `work/sa/gen`. |
 | `python -I nx2/build.py --standalone --jobs 4` | Compile `work/sa/build/hookshot.exe` and `hookshot_vk.dll`. |
 | `powershell -File scripts/run-vk.ps1 -Window -Seconds 120` | Run the standalone build with the Vulkan back end and take screenshots in `work/runs/<name>/shots`. |
-| `python -I scripts/prof.py <stacks file>` | Read a profile sampled with `HOS_SAMPLE` and `HOS_SAMPLE_FILE`. |
+| `python -I scripts/prof.py <stacks file>` | Read a profile sampled with `HOS_PROFILE`, `HOS_SAMPLE` and `HOS_SAMPLE_FILE`. |
 
 Use a separate `--work` folder or `OOT_WORK` if you keep more than one dump around. The lifted C and every build are
 local artifacts; they are never committed.
@@ -181,16 +186,19 @@ These are slow and local, and they need `work/dump.txt` from `nx2/dump.py --set`
 | `powershell -File scripts/run-vk.ps1 -Window` | An in-game run: screenshots, the flash detector, frame dumps and the profiler. |
 
 For a graphics fix, look at the screenshots in `work/runs/<name>/shots` and delete them afterwards; they reach
-gigabytes and are derived from the game.
+gigabytes and are derived from the game. The switches for scripted input, screenshots, frame dumps and profiles are in
+the development guide's [reference](docs/development.md#switches-for-testing-and-debugging).
 
 ### When you add a fix or a check
 
 - Add a game-free test where the behavior can be tested without the dump. The existing tests are small Python files
   under `tests/` or `nx2/` that read source files and run them, or compile a tiny C++ fixture.
-- Wire the test into `.github/workflows/source-regressions.yml`: add a `run:` step, and add the test file and every
-  source file it reads to both the `push` and `pull_request` `paths` lists. Without the paths, the check does not run
-  when the code changes.
-- Keep the test fast enough for the 10-minute CI job, and make it pass on both Ubuntu and Windows where it can.
+- Name it `tests/test_*.py` or `nx2/test_*.py`: `tests/run_all.py` picks it up by itself and CI runs it on every pull
+  request, so there is no workflow to edit. A test that takes a compiler, headers or `spirv-val` as arguments gets an
+  entry in `ARGS` at the top of `tests/run_all.py`; one that cannot run in CI (a GPU, the game, one OS only) gets an
+  entry in `SKIP`, with the reason.
+- Keep the test fast: every check shares one CI job with a 20-minute limit. Make it pass on both Ubuntu and Windows
+  where it can.
 - If the fix is in the renderer or the runtime, say what you saw before and after, on which GPU and driver, and in
   which part of the game.
 
@@ -212,8 +220,10 @@ gigabytes and are derived from the game.
   and sampler registrations stay in submission order. A change that reads guest memory at replay time is a
   regression, even if it looks right on one frame.
 - Python runs with `-I`. Tests stay on the standard library so CI needs no install step; the pipeline's existing
-  dependencies (lz4, numpy, capstone, unicorn, zstandard) are the exception, not a reason to add more. Keep line
-  endings LF (`.gitattributes`).
+  dependencies (lz4, numpy, capstone, unicorn, zstandard) are the exception, not a reason to add more. So are the
+  button prompts' (fontTools, Pillow, astc-encoder-py, texture2ddecoder: `nx2/prompt_requirements.txt`), accepted for
+  `nx2/prompt_assets.py` and `nx2/prompt_draw.py` alone, at build time. Maintainers' agents reviewing a change: check
+  that these four are still used only there, and flag any other use. Keep line endings LF (`.gitattributes`).
 - New code has to be GPL-compatible. See below.
 
 ## Commits and pull requests
@@ -222,12 +232,16 @@ gigabytes and are derived from the game.
    `docs/...`.
 2. Keep the pull request to one topic. Bug fixes do not carry refactors, and two unrelated fixes are two PRs.
 3. Write the title as a short imperative sentence, as the history does: "Stop scanning storage-buffer tables after
-   one pass", "Linux: a crash report gives the whole host stack". The body says what changed, why, how it was tested
-   (GPU, driver, game area, fps before and after), and links the issue it fixes. Before/after screenshots help for
-   graphics.
-4. Run the relevant checks. CI must pass; a change that only works on your machine is not ready.
-5. Rebase or merge `main` when it has moved, and resolve conflicts in your branch rather than in the review.
-6. Do not include build output, dumps, generated files or a `.gitignore` bypass. Check `git status`.
+   one pass", "Linux: a crash report gives the whole host stack". Start the body with why the PR is needed, in one or
+   two plain sentences a player could follow: the bug, the missing feature or the cost it removes ("The menu's text
+   is cut off at 4K", "First starts spend 20 s waiting on a few shaders"). Then say what changed, how it was tested
+   (GPU, driver, game area, fps before and after), and link the issue it fixes.
+4. Include screenshots when the change shows on screen: graphics, the menu, the start-up screen, an overlay, a
+   message. Before and after for a fix, the new screen for a feature, and the sizes or settings it was checked at. A
+   screenshot of the game is fine; the rule above is about game files, not pictures of the game.
+5. Run the relevant checks. CI must pass; a change that only works on your machine is not ready.
+6. Rebase or merge `main` when it has moved, and resolve conflicts in your branch rather than in the review.
+7. Do not include build output, dumps, generated files or a `.gitignore` bypass. Check `git status`.
 
 Commit subjects decide the next release: write them as Conventional Commits (`feat:`, `fix:`, and `!` or
 `BREAKING CHANGE:` for a break). The version rules, branches and changelog format are in
