@@ -70,7 +70,7 @@ if [[ ! -f $here/build.py || ! -f $here/../nx2/lift.py ]]; then
     mkdir -p -- "$home"
     step "PS5_Hookshot at $REF, into $home/PS5_Hookshot"
     if [[ ! -d $home/PS5_Hookshot/.git ]]; then
-        git clone -q --branch "$REF" https://github.com/mihawk-99/PS5_Hookshot.git "$home/PS5_Hookshot"
+        git -c advice.detachedHead=false clone -q --branch "$REF" https://github.com/mihawk-99/PS5_Hookshot.git "$home/PS5_Hookshot"
     else
         git -C "$home/PS5_Hookshot" fetch -q --tags origin
         git -C "$home/PS5_Hookshot" checkout -q "$REF" ||
