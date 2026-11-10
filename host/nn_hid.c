@@ -138,6 +138,63 @@ static void mouse_look_tick(void) {
     if (fabs(look_x) < 1e-6 && fabs(look_y) < 1e-6) look_x = look_y = 0;
 }
 
+/* (host/oot_menu.c) A drag of the free mouse in the game's own menus (the map, the tapestry): panned as
+   the camera's mouse is (mouse_look_move, mouse_look_tick: the same sensitivity, least deflection and decay), on the
+   left stick (right = 0: the map's and the tapestry's pan) or the right (1: Key Items' stones turned). The pixels it
+   moved (y up) come from the game's thread; the read takes them. The camera's 0.03 a count is for raw counts, several
+   to a screen pixel at a mouse's usual DPI: a pixel here is HOS_MENU_DRAG_GAIN of them (6) */
+/* (display.c hides the free mouse in the game's menus while the player uses a pad or the keys) the last
+   time the player's pads (a button, a stick past a third) or bound keys were used */
+static volatile LONG64 player_input_ns;
+int64_t hos_player_input_ns(void) { return InterlockedCompareExchange64(&player_input_ns, 0, 0); }
+static void player_used(void) { InterlockedExchange64(&player_input_ns, hos_now_ns()); }
+static volatile LONG drag_dx, drag_dy, drag_right;
+static double drag_x, drag_y;
+void hos_hid_drag(int dx, int dy, int right) {
+    if (right != (int)drag_right) InterlockedExchange(&drag_right, right);
+    InterlockedExchangeAdd(&drag_dx, dx);
+    InterlockedExchangeAdd(&drag_dy, dy);
+}
+static void host_drag_read(int32_t stick[4]) {
+    static int64_t next_tick;
+    const int64_t now = hos_now_ns();
+    const int dx = (int)InterlockedExchange(&drag_dx, 0), dy = (int)InterlockedExchange(&drag_dy, 0);
+    if (dx || dy) {
+        static double gain = -1;
+        if (gain < 0) {
+            const char *e = getenv("HOS_MENU_DRAG_GAIN");
+            gain = e && atof(e) > 0 ? atof(e) : 6.0;
+        }
+        const double k = (hos_mouse_sens > 0 ? hos_mouse_sens : 1.0) * 0.03 * gain;
+        drag_x += dx * k;
+        drag_y += dy * k;
+        const double length = sqrt(drag_x * drag_x + drag_y * drag_y), least = 0.2;
+        if (length > 0 && length < least) drag_x *= least / length, drag_y *= least / length;
+    }
+    if (drag_x == 0 && drag_y == 0) { next_tick = 0; return; }
+    double ox = drag_x, oy = drag_y;
+    const double shown = sqrt(ox * ox + oy * oy);
+    if (shown > 1) ox /= shown, oy /= shown;
+    const int32_t v[2] = {(int32_t)(ox * 32767), (int32_t)(oy * 32767)};
+    const int at = drag_right ? 2 : 0;
+    for (int i = 0; i < 2; i++)
+        if ((v[i] < 0 ? -v[i] : v[i]) > (stick[at + i] < 0 ? -stick[at + i] : stick[at + i])) stick[at + i] = v[i];
+    /* (the decay, a tick each 10 ms since the last read, as the camera's) */
+    int64_t ticks = next_tick ? (now - next_tick) / MOUSE_TICK_NS + 1 : 1;
+    if (ticks > 10) ticks = 10;
+    next_tick = now + MOUSE_TICK_NS;
+    static double decay_rate = -1, min_decay;
+    if (decay_rate < 0) decay_rate = mouse_percent("HOS_MOUSE_DECAY", 0.30), min_decay = mouse_percent("HOS_MOUSE_MIN_DECAY", 0.20);
+    for (int64_t t = 0; t < ticks; t++) {
+        double length = sqrt(drag_x * drag_x + drag_y * drag_y);
+        if (length > 1.5) drag_x *= 1.5 / length, drag_y *= 1.5 / length, length = 1.5;
+        const double c = length < 1 ? length : 1, decay = 1 - c * c * decay_rate, most = 1 - min_decay;
+        const double keep = decay < most ? (decay > 0 ? decay : 0) : most;
+        drag_x *= keep, drag_y *= keep;
+    }
+    if (fabs(drag_x) < 1e-6 && fabs(drag_y) < 1e-6) drag_x = drag_y = 0;
+}
+
 /* While the ability wheel is open (L held, Q on the keyboard), the mouse points instead of panning (MacNativeGames
    2d0f0f0, MIT): the wheel picks the ability the right stick points at, and with panning the stick settled back to
    the centre as soon as the mouse stopped, taking the pick with it. The stick starts at the centre, stays where the
@@ -359,9 +416,15 @@ static int parse_presses(const char *s, int64_t base_ms, int live) {
     return got;
 }
 
+/* the host's own presses and stick (host/oot_menu.c: the game's menus' mouse), below: taken with the script's */
+static void host_taps(void);
+static void host_stick_read(int32_t stick[4]);
+static void host_drag_read(int32_t stick[4]);   /* (above) */
+
 static void scripted_input(uint64_t *buttons, int32_t stick[4]) {
     if (npresses < 0) parse_script();
     live_input();
+    host_taps();
     const int64_t ms = script_elapsed_ms(hos_now_ns());
     for (int i = 0; i < npresses; i++)
         if (ms >= presses[i].start_ms && ms < presses[i].end_ms) {
@@ -369,6 +432,51 @@ static void scripted_input(uint64_t *buttons, int32_t stick[4]) {
             for (int k = 0; k < 4; k++)
                 if (presses[i].stick[k]) stick[k] = presses[i].stick[k];
         }
+    host_stick_read(stick);
+    host_drag_read(stick);
+}
+
+/* (host/oot_menu.c) presses from the host, in the script's syntax ("0:A/100"), from now: the game's pause
+   menu's clicks. Any thread; the next read takes them */
+static SRWLOCK tap_lock = SRWLOCK_INIT;
+static char tap_text[256];
+void hos_hid_tap(const char *press) {
+    AcquireSRWLockExclusive(&tap_lock);
+    const size_t n = strlen(tap_text);
+    if (n + strlen(press) + 2 < sizeof tap_text) snprintf(tap_text + n, sizeof tap_text - n, "%s%s", n ? "," : "", press);
+    ReleaseSRWLockExclusive(&tap_lock);
+}
+/* a stick from the host (the pause menu's map: a drag pans, the wheel zooms): the four axes (left x, y,
+   right x, y; +-32767) until hold_ms from now, the latest call's */
+static volatile LONG host_stick[4];
+static volatile LONG64 host_stick_until;
+void hos_hid_stick(int lx, int ly, int rx, int ry, int hold_ms) {
+    InterlockedExchange(&host_stick[0], lx), InterlockedExchange(&host_stick[1], ly);
+    InterlockedExchange(&host_stick[2], rx), InterlockedExchange(&host_stick[3], ry);
+    InterlockedExchange64(&host_stick_until, hos_now_ns() + (int64_t)hold_ms * 1000000);
+}
+static void host_stick_read(int32_t stick[4]) {
+    if (hos_now_ns() >= InterlockedCompareExchange64(&host_stick_until, 0, 0)) return;
+    {   /* (HOS_MENU_TRACE: the stick as the game reads it, at most 4 a second) */
+        static int trace = -1;
+        static int64_t logged;
+        if (trace < 0) trace = getenv("HOS_MENU_TRACE") != NULL;
+        if (trace && hos_now_ns() - logged > 250000000)
+            logged = hos_now_ns(), hos_log("hid: the host's stick %ld %ld %ld %ld read", (long)host_stick[0], (long)host_stick[1],
+                                          (long)host_stick[2], (long)host_stick[3]);
+    }
+    for (int i = 0; i < 4; i++) {
+        const int32_t v = (int32_t)host_stick[i];
+        if ((v < 0 ? -v : v) > (stick[i] < 0 ? -stick[i] : stick[i])) stick[i] = v;
+    }
+}
+static void host_taps(void) {
+    char text[sizeof tap_text];
+    AcquireSRWLockExclusive(&tap_lock);
+    memcpy(text, tap_text, sizeof text);
+    tap_text[0] = 0;
+    ReleaseSRWLockExclusive(&tap_lock);
+    if (text[0]) parse_presses(text, script_elapsed_ms(hos_now_ns()), 1);
 }
 
 static void stick_max(int32_t stick[4], const int32_t v[4]) {
@@ -708,10 +816,13 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
             *buttons |= pb;
             stick_max(stick, ps);
         }
+        if (pb || ps[0] > 12000 || ps[0] < -12000 || ps[1] > 12000 || ps[1] < -12000 || ps[2] > 12000 || ps[2] < -12000 ||
+            ps[3] > 12000 || ps[3] < -12000)
+            player_used();
     }
     binds_load();   /* (the keys: key_default's, or hookshot_options.ini's; the mouse's buttons once its capture is known) */
     for (int i = 0; i < HOS_SW_N; i++)
-        if (bound_down(i, 0)) *buttons |= 1ULL << i;
+        if (bound_down(i, 0)) *buttons |= 1ULL << i, player_used();
     int32_t mouse[4] = {0};
     /* the mouse's motion: the camera itself (mouse_native.c) with the menu's Mouse camera on Native, else the right
        stick; also the stick while the player camera does not run (the pause menu, other cameras: mouse_native.c) */
@@ -742,6 +853,7 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
                              (bound_down(HOS_KEY_MOVE_UP, captured) - bound_down(HOS_KEY_MOVE_DOWN, captured)) * 32767,
                              cx * 32767, cy * 32767};
     stick_max(stick, keys);
+    if (keys[0] || keys[1] || keys[2] || keys[3]) player_used();
 }
 
 static void vibration_send(uint64_t handle, uint64_t value);

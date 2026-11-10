@@ -263,6 +263,7 @@ public partial class MainWindow : Window
         PrepareTick.IsChecked = !s.PrepareLater;
         if (!string.IsNullOrEmpty(s.Out)) OutPath.Text = s.Out;
         DlssTick.IsChecked = s.Dlss;
+        FsrTick.IsChecked = s.Fsr;
         if (s.Romfs != null && s.Exefs != null && Directory.Exists(s.Romfs) && File.Exists(System.IO.Path.Combine(s.Exefs, "main")))
         {
             romfs = s.Romfs;
@@ -285,7 +286,7 @@ public partial class MainWindow : Window
         try
         {
             var s = new BuilderSettings { Out = OutPath.Text, Nup = romfs == null ? chosenNup : null, Romfs = romfs, Exefs = exefs,
-                                          Dlss = DlssTick.IsChecked == true,
+                                          Dlss = DlssTick.IsChecked == true, Fsr = FsrTick.IsChecked == true,
                                           PrepareLater = PrepareTick.IsChecked != true };
             Directory.CreateDirectory(System.IO.Path.GetDirectoryName(SettingsPath)!);
             File.WriteAllText(SettingsPath, System.Text.Json.JsonSerializer.Serialize(s));
@@ -685,6 +686,7 @@ public partial class MainWindow : Window
         else if (chosenNup != null) args.AddRange(new[] { "--nup", chosenNup });
         else return;
         args.AddRange(new[] { "--out", OutPath.Text, "--language", lang.Code });
+        if (FsrTick.IsChecked == true) args.Add("--fsr");   // (an --update of the folder keeps it: make_game.py's mark)
         prepareNow = PrepareTick.IsChecked == true;
         Run(tools, ShaderStep.Args(args, prepareNow), dlss: DlssTick.IsChecked == true);
     }
@@ -1189,9 +1191,11 @@ public partial class MainWindow : Window
     {
         download = null;
         if (rows.TryGetValue("download", out var d)) { d.Done(); d.Small("Build tools checked"); }
-        // (a folder built with NVIDIA DLSS, its license accepted then, is built with it again)
-        var dlss = File.Exists(System.IO.Path.Combine(folder, "ngx", "nvngx_dlss.dll")) &&
-                   File.Exists(System.IO.Path.Combine(Storage.NgxSdk, "LICENSE.txt"));
+        // (the saved tick also opts an existing game into DLSS. After a self-update ApplySettings has not run yet;
+        // a folder already built with DLSS keeps it, its license accepted then)
+        var dlss = BuilderSettings.Load(SettingsPath)?.Dlss == true ||
+                   (File.Exists(System.IO.Path.Combine(folder, "ngx", "nvngx_dlss.dll")) &&
+                    File.Exists(System.IO.Path.Combine(Storage.NgxSdk, "LICENSE.txt")));
         // (prepareNow: the saved choice, read in BeginUpdate. The launcher's Update and the --update start after a self-update never
         // ran ApplySettings, so the tick there is only its default)
         Run(tools, ShaderStep.Args(new List<string> { "--update", folder }, prepareNow), keepRows: true, dlss: dlss);

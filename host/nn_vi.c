@@ -108,8 +108,8 @@ HLE(_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE) {
    HOS_NO_PACING=1: as fast as it can. */
 static volatile int present_interval = 1;
 /* (hookshot) HOS_FPS_MAX=<61-240>: the frame rate cap past the console's 60 (opt-in, a test): the display pacing's interval, the game's
-   own limiter (+0xfc) and the real-time step's rate (+0x2c8, game time = 60 / rate a frame) all go up to it, so the game is not sped up.
-   Unset or 60: 60, as on the console */
+   own limiter (+0xfc) and the vsync event go up to it, and the game's time step is the frames' own time (realtime_step), so the game is
+   not sped up. Unset or 60: 60, as on the console */
 int hos_ini_option(const char *key, int otherwise);   /* (nn_applet.c) */
 static int fps_max(void) {
     static int v = -1;
@@ -221,6 +221,9 @@ static float text_scale(const char *env, int menu) {
     const int v = env && *env ? atoi(env) : menu;
     return v == 1 ? 2.0f : v == 2 ? 4.0f : v >= 3 ? 1e6f : 1.0f;
 }
+volatile uint64_t hos_step_probe = 0;   /* (f_80706be0's object, set by the lifted code when the frame-time hook is in this build; its
+                                            +0xd58 is the game clock in 1/60 s: nx2/oot_patches.py) */
+volatile uint32_t hos_frame_seconds_bits = 0;   /* (the frame's seconds as a float's bits for that hook, 0: the game's own step) */
 volatile uint64_t hos_res_module = 0;   /* (f_831f3200's object, whose +0xe5c is the 3D's scale: nx2/oot_patches.py) */
 static void realtime_step(int64_t now) {
     int rx_option(int id, int otherwise);
@@ -275,6 +278,18 @@ static void realtime_step(int64_t now) {
             hos_log("vi: frame limiter %d, vrr %d %d, nominal %d, controller +0x58.. %d %d %d %d", *limit, *(uint8_t *)GP(mod + 0x231),
                     *(uint8_t *)GP(mod + 0x232), *(int *)GP(mod + 0x2c8), *(int *)GP(mod + 0x270 + 0x58), *(int *)GP(mod + 0x270 + 0x28),
                     *(int *)GP(mod + 0x270 + 0x2c), *(int *)GP(mod + 0x270 + 0x30));
+        if (log_on && !((n - 1) % 300) && hos_step_probe) {   /* (game speed: the game clock's 1/60 s units a second of wall time, 60.0 at speed 1) */
+            static double clock_before;
+            static int64_t at_before;
+            double game_clock;
+            memcpy(&game_clock, GP(hos_step_probe + 0xd58), 8);
+            if (at_before && now > at_before) {
+                const double rate = (game_clock - clock_before) * 1e9 / (double)(now - at_before);
+                hos_log("vi: game clock %.1f: %.2f a second of wall time (speed %.3f) at %.1f fps", game_clock, rate, rate / 60.0,
+                        300e9 / (double)(now - at_before));
+            }
+            clock_before = game_clock, at_before = now;
+        }
         if (target && *limit > 0 && *limit < target) *limit = target;
         if (fps_max() > 60 && *limit > 0 && *limit < fps_max()) *limit = fps_max();
     }
@@ -302,11 +317,29 @@ static void realtime_step(int64_t now) {
     if (count < (unsigned)window) count++;
     double sum = 0;
     for (unsigned i = 0; i < count; i++) sum += samples[i];
+    /* (hookshot) A cap above 60: the engine's own rate is 60 / <whole display intervals>, and its controller puts 60 back over a
+       higher +0x2c8 before the step is made from it, so every frame still stepped 1/60 s and the game ran fps / 60 times too fast.
+       The step is then the frames' own time at the two places the engine makes it (nx2/oot_patches.py, hos_frame_seconds_bits):
+       this same average, at most 1/15 s as below and at least 1/240 s, and the rate under it stays the engine's, 60 at most.
+       HOS_FPS_STEP=0, or a lift without the hook (hos_step_probe unset): the rate up to the cap, as before */
+    static int timed_step = -1;
+    if (timed_step < 0) timed_step = !(getenv("HOS_FPS_STEP") && !atoi(getenv("HOS_FPS_STEP")));
+    const int timed = fps_max() > 60 && timed_step && hos_step_probe;
+    if (timed) {
+        const double secs = sum / count;
+        const float f = (float)(secs > 4.0 / 60.0 ? 4.0 / 60.0 : secs < 1.0 / 240.0 ? 1.0 / 240.0 : secs);
+        uint32_t bits;
+        memcpy(&bits, &f, 4);
+        hos_frame_seconds_bits = bits;
+    } else {
+        hos_frame_seconds_bits = 0;
+    }
+    const int top = timed ? 60 : fps_max();
     double ratio = sum / count * 60.0 + carry;
-    const double least = 60.0 / fps_max();
+    const double least = 60.0 / top;
     ratio = ratio < least ? least : ratio > 4.0 ? 4.0 : ratio;
     int fps = (int)(60.0 / ratio + 0.5);
-    fps = fps < 15 ? 15 : fps > fps_max() ? fps_max() : fps;
+    fps = fps < 15 ? 15 : fps > top ? top : fps;
     int *slot = (int *)GP(mod + 0x2c8);
     if (*slot < 15 || *slot > fps_max()) {
         static int logged;

@@ -399,7 +399,12 @@ class Builder(tk.Tk):
                         raise RuntimeError("These tools are a source checkout, so they cannot download a release. Start the AppImage to update.")
                     manifest = linux_update.startup_manifest(root)
                     if manifest.tag != linux_update.tools_tag(root):
-                        source = linux_update.read_manifest(root)
+                        # (as Windows does: GitHub's latest list lags right after a publish, and installing it would put
+                        # the release before the one asked for over these tools)
+                        if self.update_tag and manifest.tag != self.update_tag:
+                            raise RuntimeError("GitHub offered %s, not %s: its download links can lag right after a release. "
+                                               "Try Update again in a few minutes." % (manifest.tag, self.update_tag))
+                        source =linux_update.read_manifest(root)
                         apprun = linux_update.install(manifest, root, source, note=lambda message: self.lines.put(("note", message)))
                         for name in ("APPDIR", "APPIMAGE", "ARGV0", "OWD", "LD_LIBRARY_PATH"):
                             os.environ.pop(name, None)

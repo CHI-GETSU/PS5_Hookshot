@@ -40,6 +40,10 @@ def main():
     if not shutil.which("git"):
         print("changelog: skipped (git is not installed)")
         return
+    # (a scratch repository, without the user's and the system's git settings: commit.gpgSign signed every commit with
+    # the user's key, and tag.gpgSign made `git tag v0.1.0` an annotated tag that wants a message, so the test failed.
+    # The changelog script's git runs inherit this)
+    os.environ.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
     root = tempfile.mkdtemp(prefix="hookshot-changelog-")
     try:
         os.makedirs(os.path.join(root, "scripts"))

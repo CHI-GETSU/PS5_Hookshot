@@ -20,6 +20,8 @@ import urllib.error
 import urllib.request
 import zipfile
 
+from part_links import SYSROOT_PART, is_absolute_link, relative_sysroot_link
+
 LIST_NAME = "hookshot-linux.txt"
 LATEST_LIST = "https://github.com/NotRexed/Hookshot/releases/latest/download/" + LIST_NAME
 LATEST_API = "https://api.github.com/repos/NotRexed/Hookshot/releases/latest"
@@ -215,7 +217,8 @@ def _https(url):
 
 
 def _request(url, timeout, limit=MAX_DOWNLOAD):
-    req = urllib.request.Request(_https(url), url, headers={"User-Agent": "Hookshot", "Accept": "application/vnd.github+json"})
+    # (no second argument: Request's second is the POST body, and a str body failed every download before connecting)
+    req = urllib.request.Request(_https(url), headers={"User-Agent": "Hookshot", "Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return _read_at_most(response, limit)
 
@@ -289,11 +292,15 @@ def _sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def _clone(src, dst):
+def _clone(src, dst, root, rooted_links=None):
     """A copy of src at dst. A hard link when the two are on one disk (the installed copy); a real copy from the
     AppImage's mount, which does not link."""
     if os.path.islink(src):
-        os.symlink(os.readlink(src), dst)
+        link_to = os.readlink(src)
+        if rooted_links is not None and is_absolute_link(link_to):
+            rooted_links.append((dst, link_to))
+        else:
+            _symlink(root, link_to, dst)
         return
     try:
         os.link(src, dst)
@@ -302,7 +309,9 @@ def _clone(src, dst):
         shutil.copy2(src, dst)
 
 
-def _clone_tree(src, dst):
+def _clone_tree(src, dst, rebase_sysroot=False, root=None):
+    root = dst if root is None else root
+    rooted_links = [] if rebase_sysroot else None
     for dirpath, dirnames, filenames in os.walk(src, followlinks=False):
         rel = os.path.relpath(dirpath, src)
         out = dst if rel == os.curdir else os.path.join(dst, rel)
@@ -311,12 +320,14 @@ def _clone_tree(src, dst):
         for name in dirnames:
             link = os.path.join(dirpath, name)
             if os.path.islink(link):
-                _clone(link, os.path.join(out, name))
+                _clone(link, os.path.join(out, name), root, rooted_links)
             else:
                 kept.append(name)
         dirnames[:] = kept
         for name in filenames:
-            _clone(os.path.join(dirpath, name), os.path.join(out, name))
+            _clone(os.path.join(dirpath, name), os.path.join(out, name), root, rooted_links)
+    if rooted_links is not None:
+        _finish_sysroot_links(dst, rooted_links)
 
 
 def _safe_name(name):
@@ -330,8 +341,46 @@ def _check_part_directory(path):
         raise ValueError("the update would write through a symbolic link: %s" % path)
 
 
-def _unpack(data, dest, files):
+def _symlink(root, link_to, target):
+    # The whole staging tree is the boundary: a valid toolchain link may name a different part or a later entry.
+    root = os.path.abspath(root)
+    # (".." only at the start: "x/../.." is checked as written, but the system resolves x first, and x may be a link the
+    # same zip or a later part makes, so the check and the system would disagree)
+    parts = link_to.split("/")
+    ups = 0
+    while ups < len(parts) and parts[ups] == "..":
+        ups += 1
+    if ".." in parts[ups:]:
+        raise ValueError("an update symlink climbs after a name: %s -> %s" % (target, link_to))
+    destination = os.path.abspath(os.path.join(os.path.dirname(target), link_to))
+    real_root = os.path.realpath(root)
+    if (is_absolute_link(link_to) or os.path.commonpath((root, destination)) != root or
+            os.path.commonpath((real_root, os.path.realpath(destination))) != real_root):
+        raise ValueError("an update symlink leaves its staging folder: %s -> %s" % (target, link_to))
+    os.symlink(link_to, target)
+
+
+def _finish_sysroot_links(dest, rooted_links):
+    while rooted_links:
+        pending = []
+        for target, link_to in rooted_links:
+            try:
+                relative = relative_sysroot_link(dest, target, link_to)
+            except FileNotFoundError:
+                pending.append((target, link_to))
+                continue
+            _check_part_directory(os.path.dirname(target))
+            os.symlink(relative, target)
+        if len(pending) == len(rooted_links):
+            raise ValueError("sysroot links have missing or circular targets: %s" %
+                             ", ".join("%s -> %s" % (target, link_to) for target, link_to in pending))
+        rooted_links = pending
+
+
+def _unpack(data, dest, files, rebase_sysroot=False, root=None):
+    root = dest if root is None else root
     os.makedirs(dest, exist_ok=True)
+    rooted_links = []
     with zipfile.ZipFile(__import__("io").BytesIO(data)) as zipped:
         for info in zipped.infolist():
             name = _safe_name(info.filename)
@@ -345,42 +394,70 @@ def _unpack(data, dest, files):
             os.makedirs(parent, exist_ok=True)
             mode = info.external_attr >> 16
             if stat.S_ISLNK(mode):
-                os.symlink(zipped.read(info).decode("utf-8"), target)
+                link_to = zipped.read(info).decode("utf-8")
+                # Released sysroots contain /lib links rooted inside the sysroot; other parts must reject absolute links.
+                if is_absolute_link(link_to):
+                    if not rebase_sysroot:
+                        raise ValueError("a zip symlink has an absolute target: %s -> %s" % (name, link_to))
+                    rooted_links.append((target, link_to))
+                else:
+                    _symlink(root, link_to, target)
             else:
                 # A part can ship symlinks, but cannot overwrite one (or any earlier entry).
                 with open(target, "xb") as out:
                     out.write(zipped.read(info))
                 if mode & 0o777:
-                    os.chmod(target, mode & 0o777)
+                    # (the modes the parts are made with: no group- or world-writable files from a zip)
+                    os.chmod(target, 0o755 if mode & 0o111 else 0o644)
+    _finish_sysroot_links(dest, rooted_links)
 
 
 def _place(part, source_root, source, dest_root, get, note):
     # Resolve installation parent links without following the staging directory itself.
     parent, staging = os.path.split(os.path.abspath(dest_root))
-    dest = os.path.join(os.path.realpath(parent), staging, _safe_name(part.dest))
+    staging_root = os.path.join(os.path.realpath(parent), staging)
+    dest = os.path.join(staging_root, _safe_name(part.dest))
     _check_part_directory(dest)
     old = source.by_sha(part.sha) if source else None
     src = os.path.join(source_root, part.dest) if old and old.same(part) and source_root else ""
     ready = src and os.path.isdir(src) and (part.files is None or all(
         os.path.lexists(os.path.join(src, name)) for name in part.files))
+    rebase_sysroot = part.dest == SYSROOT_PART
     if ready:
         note("Keeping %s (unchanged)" % part.dest)
         if part.files is None:
-            _clone_tree(src, dest)
+            _clone_tree(src, dest, rebase_sysroot, staging_root)
         else:
             os.makedirs(dest, exist_ok=True)
+            rooted_links = [] if rebase_sysroot else None
             for name in part.files:
-                _clone(os.path.join(src, name), os.path.join(dest, name))
+                _clone(os.path.join(src, name), os.path.join(dest, name), staging_root, rooted_links)
+            if rooted_links is not None:
+                _finish_sysroot_links(dest, rooted_links)
         return
     note("Downloading %s (%d MB)" % (part.dest, part.size >> 20))
     data = get(part.url)
     if len(data) != part.size or _sha256(data) != part.sha:
         raise RuntimeError("%s did not download correctly (its checksum differs)" % part.dest)
-    _unpack(data, dest, part.files)
+    _unpack(data, dest, part.files, rebase_sysroot, staging_root)
+
+
+def _check_links_inside(dest):
+    """Every link in the finished staging tree resolves inside it, whatever order the parts made them in."""
+    real = os.path.realpath(dest)
+    for dirpath, dirnames, filenames in os.walk(dest, followlinks=False):
+        for name in dirnames + filenames:
+            path = os.path.join(dirpath, name)
+            if os.path.islink(path) and os.path.commonpath((real, os.path.realpath(path))) != real:
+                raise ValueError("an update symlink leaves its staging folder: %s" % path)
 
 
 def _finish_tree(dest):
     """AppRun at the root, from the tools just installed, so this folder starts the way the AppImage does."""
+    _check_links_inside(dest)
+    for name in ("AppRun", "hookshot.png", "hookshot-builder.desktop"):
+        if os.path.islink(os.path.join(dest, name)):   # (written below: never through a link a part made)
+            raise ValueError("the update has a link where %s goes" % name)
     tools = os.path.join(dest, "usr", "share", "hookshot")
     apprun = os.path.join(dest, "AppRun")
     shutil.copyfile(os.path.join(tools, "builder", "linux", "AppRun"), apprun)
@@ -411,7 +488,8 @@ def install(manifest, source_root, source, note=None, get=None):
     try:
         for part in manifest.parts:
             _place(part, source_root, source, partial, get, note)
-        with open(os.path.join(partial, LIST_NAME), "w", encoding="utf-8", newline="\n") as handle:
+        # The publisher keeps the list outside all hashed parts. Never follow or overwrite a part-supplied leaf.
+        with open(os.path.join(partial, LIST_NAME), "x", encoding="utf-8", newline="\n") as handle:
             handle.write("tag %s\n" % manifest.tag)
             for part in manifest.parts:
                 handle.write("part %s %d %s %s\n" % (part.sha, part.size, part.dest, part.url))

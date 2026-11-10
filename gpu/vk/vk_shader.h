@@ -90,7 +90,7 @@ const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t c
 void program_wait(const Program* p);
 uint64_t program_cache_stamp();   // (what the kept programs and pipelines are good for)
 size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const std::function<void(Program&)>& fn,
-                               bool computes = true);   // (computes: and every kept compute program)
+                               bool computes = true, bool fallbacks = false);   // (computes: and every kept compute program)
 /// The precompile of every shader of the game (hookshot_shaders.bin, from nx2/shader_census.py): how many programs it names, 0: none
 size_t seed_open();
 std::string seed_path();   // (hookshot_shaders.bin, beside the game)

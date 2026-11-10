@@ -174,6 +174,7 @@ bool memory_table_flush() { return false; }
 bool memory_rb_refresh(VkCommandBuffer) { return false; }
 void memory_rb_recording_begun() {}
 VkCommandBuffer last_barrier_cmd = VK_NULL_HANDLE;
+thread_local VkCommandBuffer last_pass_end_cmd = VK_NULL_HANDLE;
 bool is_bc(VkFormat) { return false; }
 bool is_astc(VkFormat) { return false; }
 #include "init_upload.inc"
@@ -330,7 +331,9 @@ Recording& begin_recording(uint64_t value) {
     vkBeginCommandBuffer(post.cmd, nullptr);
     vkBeginCommandBuffer(post.upload, nullptr);
     post.value = value;
+    last_pass_end_cmd = post.cmd;
     texture_begin_recording(post.upload, value);
+    CHECK(last_pass_end_cmd == VK_NULL_HANDLE);
     draw_begin_recording(post.slot, post.cmd, value);
     return post;
 }

@@ -5,4 +5,5 @@
 fonttools==4.68.0
 pillow==13.0.0
 astc-encoder-py==0.1.12
+archspec==0.2.7  # astc-encoder-py's runtime dependency (the Windows package installs with --no-deps)
 texture2ddecoder==1.0.6

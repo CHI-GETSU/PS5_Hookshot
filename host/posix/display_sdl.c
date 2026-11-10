@@ -295,7 +295,7 @@ void hos_display_loop(void) {
                 case HOS_SDL_EV_KEY_DOWN: {
                     const int scancode = e.scancode, mod = e.mod;
                     if (e.scancode == 41) mouse_capture(0);   /* Esc */
-                    if (!e.repeat && (scancode == 68 || (scancode == 40 && (mod & 0x300)))) set_fullscreen(!fullscreen);   /* F11, Alt+Enter */
+                    if (!e.repeat && ((scancode == 68 && !(mod & 0x0FC3)) || (scancode == 40 && (mod & 0x300)))) set_fullscreen(!fullscreen);   /* F11, Alt+Enter */
                     break;
                 }
                 case HOS_SDL_EV_MOUSE_DOWN:

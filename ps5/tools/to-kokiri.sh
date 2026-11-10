@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # PS5: a run from launch towards Kokiri Forest: New Game once the title screen is up (15 screenshots in), then A every
 # 4 s through the opening and the dialogue. Screenshots in work/runs/live, the log in work/runs/NAME.*.
-#   ps5/tools/to-kokiri.sh NAME [SECONDS] [KEY=VALUE ...]   (more switches for hookshot_env.txt)
+#   ps5/tools/to-kokiri.sh NAME [SECONDS] [KEY=VALUE ...]   (more switches for the run: ps5/tools/run.py)
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 name=$1 seconds=${2:-600}

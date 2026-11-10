@@ -1,8 +1,8 @@
 // (hookshot) AMD FSR 3.1's inputs: the scene's camera and depth, made into colour, depth and motion at the render size by
 // one pass (shaders/fsr3_prep.comp); see vk_fsr3_inputs.h for what comes from #841 and what does not yet.
 //
-// The camera is taken exactly as vk_dlss.cpp's dlss_note_scene_draw takes it, from the draws into the scene's colour target:
-// their vertex stage's uniform buffer 3 holds the target's size at 0x120, this frame's view-projection at 0x30 (row major,
+// The camera is taken exactly as vk_temporal.cpp's temporal_note_scene_draw takes it, from the draws into the scene's
+// colour target: their vertex stage's uniform buffer 3 holds the target's size at 0x120, this frame's view-projection at 0x30 (row major,
 // clip = M * position) and the projection at 0x70, its w row (0, 0, -1, 0) at 0xa0. The jitter the host put on the
 // projection (nx2/oot_jitter.py: P[0][2] and P[1][2]) is read back from it, given to FSR in render pixels and taken off the
 // motion, with dlss_math.h's functions: the same jitter, read the same way, as DLSS's.
@@ -183,7 +183,7 @@ bool make_pipeline() {
     return true;
 }
 
-/// A view of a depth texture's depth alone, for sampling (made once per image: vk_dlss.cpp's depth_view)
+/// A view of a depth texture's depth alone, for sampling (made once per image: vk_temporal.cpp's depth_view)
 VkImageView depth_view(Texture* t) {
     State& s = st();
     const uint64_t gen = texture_destroy_generation();

@@ -125,7 +125,7 @@ int main(void) {
 #include <cstring>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); exit(1); } } while (0)
 enum MenuTab { TAB_CONTROLS };
-struct Options { int output_res = 0, resolution = 0, upscale = 0, dlss = 0, stick_dead_zone = 0; } opts;
+struct Options { int output_res = 0, resolution = 0, fps_cap = 0, upscale = 0, dlss = 0, stick_dead_zone = 0; } opts;
 static int output_choice(int v) { return v; }
 ''' + block(menu, "struct Row {") + ";\n" + block(menu, "const char* tx_stick_dead_zone(") + "\n" + \
         "Row rows[] = {" + row.group(0) + "};\n" + block(menu, "const char* ini_key(") + r'''

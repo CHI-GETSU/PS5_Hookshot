@@ -39,7 +39,7 @@ static int device_channels, device_asked;
 static int au_device_channels(void) { device_asked++; return device_channels; }
 HOST
 struct Row { int tab; const char* name; int* value; };
-struct { int output_res, resolution, upscale, dlss, audio_output; } opts;
+struct { int output_res, resolution, fps_cap, upscale, dlss, audio_output; } opts;
 MENU
 int main(int argc, char **argv) {
     assert(argc == 7);

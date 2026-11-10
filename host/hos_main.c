@@ -381,15 +381,21 @@ static int env_line_allowed(const char *name, const char *value) {
     /* (hookshot) the switches that name a file to write or a folder take no value here, not even a bare name: one
        resolves in the game's folder (HOS_SAMPLE_FILE=hookshot_vk.dll emptied the renderer) */
     const size_t nl = strlen(name);
-    const int names_file = (nl > 5 && (!strcmp(name + nl - 5, "_FILE") || !strcmp(name + nl - 4, "_DIR"))) ||
-                           !strcmp(name, "RX_VK_FRAME_LOG") || !strcmp(name, "HOS_PRESENT_TRACE");
+    int names_file = (nl > 5 && (!strcmp(name + nl - 5, "_FILE") || !strcmp(name + nl - 4, "_DIR"))) ||
+                     !strcmp(name, "RX_VK_FRAME_LOG") || !strcmp(name, "HOS_PRESENT_TRACE");
+    /* (hookshot) and the test switches whose value is a file or folder under another name (HOS_AUDIO_DUMP=image.bin
+       overwrote the game's image), or that press buttons and menu keys on a timer (a shared file erased a save from
+       the file select) */
+    static const char *const by_name[] = {
+        "HOS_AUDIO_DUMP", "HOS_AUDIO_WB_DUMP", "HOS_SHADER_DUMP", "HOS_FS_OVERLAY", "HOS_MODS", "HOS_INPUT_LIVE",
+        "HOS_INPUT_SCRIPT", "HOS_SAMPLE_ALL", "HOS_WATCH", "HOOKSHOT_BUILDER_HOME", "RX_VK_SHOTS", "RX_VK_SHOT_GO",
+        "RX_VK_FRAMELOG", "RX_VK_HANG_DUMP", "RX_VK_DUMP", "RX_VK_DUMP_SPV", "RX_VK_DUMP_MESH_SPV", "RX_VK_DUMP_STAGES",
+        "RX_VK_DUMP_FAILED", "RX_VK_IR", "RX_VK_MENU_SCRIPT", "RX_DUMP_WGSL", "RX_DUMP_SLOW_WGSL", "RX_DUMP_TICS",
+        "RX_WGSL_OVERRIDE"};
+    for (size_t i = 0; i < sizeof by_name / sizeof *by_name; i++) names_file |= !strcmp(name, by_name[i]);
     /* RX_VK_DLSS_DIR: a folder on this PC, not a share (\\server\x or //server/x) or a device path */
     if (!strcmp(name, "RX_VK_DLSS_DIR"))
         return !((value[0] == '\\' || value[0] == '/') && (value[1] == '\\' || value[1] == '/'));
-#ifdef __PROSPERO__
-    /* (PS5) a path in the title folder is the only place one can name: test runs' screenshots and live input */
-    if (!strncmp(value, "/app0/", 6) && !strstr(value, "..")) return 1;
-#endif
     if (names_file) return 0;
     const int drive = ((value[0] | 0x20) >= 'a' && (value[0] | 0x20) <= 'z' && value[1] == ':');
     return !strpbrk(value, "/\\") && !drive && value[0] != '~' && strcmp(value, ".") && strcmp(value, "..");
@@ -397,6 +403,15 @@ static int env_line_allowed(const char *name, const char *value) {
 static void load_hookshot_env(void) {
     char path[MAX_PATH + 32];
     const char *other = getenv("HOS_ENV_FILE");
+#ifdef __PROSPERO__
+    /* (PS5) a title is started with no environment to put HOS_ENV_FILE in: a test run's switches are in
+       hookshot_test_env.txt in the title folder, which the run tool writes before the start and takes away after the
+       run (ps5/tools/run.py). It sets anything, as HOS_ENV_FILE's file does; a player's hookshot_env.txt does not. */
+    if (!(other && *other)) {
+        FILE *test = fopen("/app0/hookshot_test_env.txt", "r");
+        if (test) fclose(test), other = "/app0/hookshot_test_env.txt";
+    }
+#endif
     if (other && *other) {
         snprintf(path, sizeof path, "%s", other);
     } else {
@@ -1375,6 +1390,13 @@ static int game_main(int argc, char **argv) {
         }
         else if (!image) image = argv[i];
     }
+#ifdef _WIN32
+    {   /* (hookshot) the Discord status (discord_rpc.c), a game run only (a --prepare-shaders run returned above). Linux starts
+           it in its own main, below; on Windows it was never started: no status and no "discord:" line in any log */
+        void hos_discord_start(void);
+        hos_discord_start();
+    }
+#endif
     static char beside_image[MAX_PATH], beside_romfs[MAX_PATH], beside_user[MAX_PATH];
     if (!image) {   /* (hookshot) started with nothing, as a game is: everything beside the executable (the builder's folder) */
         char dir[MAX_PATH];

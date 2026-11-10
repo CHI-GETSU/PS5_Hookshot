@@ -10,6 +10,9 @@
 #include <initializer_list>
 #include <mutex>
 #include <utility>
+#include "vk_present_rect.h"
+using mkwvk::PresentSourceRect;
+using mkwvk::present_source_rect;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); std::exit(1); } } while (0)
 using VkImage = uint64_t;
 using VkImageView = uint64_t;

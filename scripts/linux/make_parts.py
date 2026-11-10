@@ -15,6 +15,10 @@ import os
 import sys
 import zipfile
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                               "builder", "linux"))
+from part_links import SYSROOT_PART, is_absolute_link, relative_sysroot_link  # noqa: E402
+
 # (dest under the AppDir, and None for the whole directory or the file names when the directory holds other parts too)
 PARTS = (
     ("usr/share/hookshot", None),
@@ -58,7 +62,10 @@ def write_zip(path, root, dest, files):
             info.create_system = 3
             if os.path.islink(full):
                 info.external_attr = 0o120777 << 16
-                zipped.writestr(info, os.readlink(full), compresslevel=6)
+                link_to = os.readlink(full)
+                if dest == SYSROOT_PART and is_absolute_link(link_to):
+                    link_to = relative_sysroot_link(os.path.join(root, dest), full, link_to)
+                zipped.writestr(info, link_to, compresslevel=6)
                 continue
             info.external_attr = (0o755 if os.access(full, os.X_OK) else 0o644) << 16
             with open(full, "rb") as handle:

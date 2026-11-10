@@ -31,8 +31,9 @@ class SdlAudioLibraryTests(unittest.TestCase):
         text = SDL.read_text(encoding="utf-8")
         start = text.index("int hos_sdl_audio_open(")
         fn = text[start:text.index("\n}", start)]
-        self.assertIn('"SDL_AUDIO_DEVICE_SAMPLE_FRAMES", "480"', fn)
-        self.assertIn('getenv("SDL_AUDIO_DEVICE_SAMPLE_FRAMES")', fn)
+        self.assertIn('const char *env_samples = getenv("SDL_AUDIO_DEVICE_SAMPLE_FRAMES");', fn)
+        self.assertIn('if (version == 3 && !env_samples) hos_sdl_hint("SDL_AUDIO_DEVICE_SAMPLE_FRAMES", "480");', fn)
+        self.assertIn('want.samples = (uint16_t)(env_samples && atoi(env_samples) > 0 ? atoi(env_samples) : 512);', fn)
 
 
 if __name__ == "__main__":

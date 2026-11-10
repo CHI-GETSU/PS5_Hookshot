@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -21,13 +22,14 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <exception>
 #include <thread>
 #include <string>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
 
-#include "vk_dlss.h"
+#include "vk_temporal.h"
 #include "vk_fsr3_inputs.h"   // (the camera jitter while AMD FSR 3.1 upscales)
 #include "status_line.h"
 #include "vk_reflex.h"
@@ -43,6 +45,7 @@
 #include "vk_texture.h"
 #include "vk_xfer.h"
 #include "vk_present_rect.h"
+#include "vk_present_trace.h"
 
 #include "vk_internal.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
@@ -472,6 +475,10 @@ struct ParPoint {
     int64_t work;
 };
 std::vector<ParPoint> par_points;   // (every 64 draws and dispatches of the dry pass)
+bool dry_clears_on() {   // (the dry pass marks a clear's targets too: NOP_CLEAR_COLOR in replay())
+    static const bool v = getenv("RX_VK_NO_DRY_CLEARS") == nullptr;
+    return v;
+}
 int64_t dry_work = 0;
 size_t ub_first_of_recording = 0;  // (the current recording's first entry)
 uint64_t rec_value_now = 0;
@@ -878,11 +885,13 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         case NOP_COPY_T2T: if (!dry) { ParLock lk; copy_t2t(cmd, s, payload<nvn_p_copy_tt>(a, avail)); } break;
         case NOP_CLEAR_TEX: if (!dry) { ParLock lk; clear_tex(cmd, s, payload<nvn_p_clear_tex>(a, avail)); } break;
         case NOP_UPDATE_UB: {
+            const auto u = payload<nvn_p_update_ub>(a, avail);
             if (worker) {   // (appended by the dry pass: the draws after it read it from here on)
-                ub_limit++, ub_gen++;
+                // (hookshot) counted only when the dry pass appended it (the same test as below): an update of no bytes, or of more
+                // than the stream holds, is not in ub_updates, and counting it moved every later draw of the segment one update ahead
+                if (u.size && u.size <= avail - sizeof u) ub_limit++, ub_gen++;
                 break;
             }
-            const auto u = payload<nvn_p_update_ub>(a, avail);
             if (dump_on() && u.size && u.size <= avail - sizeof u) {   // (in a dump: each update, its first words)
                 float f[12] = {};
                 std::memcpy(f, a + sizeof u, std::min<size_t>(sizeof f, u.size));
@@ -1128,12 +1137,21 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             break;
         // ---- work ----
         case NOP_CLEAR_COLOR:
+            // (hookshot) in the dry pass a clear marks its pass's targets as the GPU's, as a draw does (dry_mark_written): the clear
+            // opens a pass on the worker, and that marks them (begin_pass), but only when the worker gets there. A target the game
+            // clears in one segment and samples in a later one was still "never written" for the later segment when it was
+            // recorded first: it uploaded what the target's memory held, an upload that runs after the clear. 13 of them in 4,300
+            // presents of Castle Town's market with the camera turning, each an 853 x 480 target made that frame ("written in
+            // segment N, uploaded by the later segment N+2; written by: a pass's colour target"), among 38 one-frame flashes
+            // against 9 on one thread. RX_VK_NO_DRY_CLEARS=1: as before
+            if (s.render_enabled && dry && dry_clears_on()) dry_mark_written(s, false, true);
             if (s.render_enabled && !dry) {
                 const auto c = payload<nvn_p_clear_color>(a, avail);
                 clear_color_target(cmd, s, c.index, c.rgba, (uint32_t)c.mask);
             }
             break;
         case NOP_CLEAR_DS:
+            if (s.render_enabled && dry && dry_clears_on()) dry_mark_written(s, false, true);   // (as NOP_CLEAR_COLOR above)
             if (s.render_enabled && !dry) {
                 const auto c = payload<nvn_p_clear_ds>(a, avail);
                 clear_depth_stencil(cmd, s, c.depth, c.depth_mask != 0, (uint32_t)c.stencil, (uint32_t)c.stencil_mask);
@@ -1255,6 +1273,9 @@ void maybe_split(VkCommandBuffer& cmd) {
 // (RX_VK_PARALLEL=<threads recording a command buffer, the replay thread one of them>; 0, 1: off, the default. Segments
 // recorded out of order left one-frame black scenes in play, 48-93 in a walk through Kakariko against none on the
 // replay thread alone, at about the same frame rate here: 36-40 fps against 38-41)
+// (hookshot) One cause of those is gone: the dry pass did not mark the targets of a clear (NOP_CLEAR_COLOR in replay()). With
+// that, Castle Town's market and eight other places showed no black frame on 3 to 8 threads; the Kakariko walk was not run
+// again, so it stays off. On a 9950X3D the replay's wall time in the market goes from 10.9 ms a frame to 7.75 on 3 threads.
 int par_threads() {
     static const int n = std::clamp(getenv("RX_VK_PARALLEL") ? atoi(getenv("RX_VK_PARALLEL")) : 0, 0, 8);
     return n;
@@ -1352,6 +1373,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     const NvnState start = state;
     const size_t ub0 = ub_updates.size();
     par_points.clear(), par_conds.clear(), dry_work = 0;
+    dry_marks_begin();
     rmode = Mode::Dry;
     VkCommandBuffer none = cmd;
     suspend_ok = may_stop;
@@ -2329,16 +2351,87 @@ VkBuffer shot_bufs[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
 VmaAllocation shot_allocs[2] = {nullptr, nullptr};
 void* shot_maps[2] = {nullptr, nullptr};
 // (RX_VK_SHOT_W / RX_VK_SHOT_H: another size, e.g. the game's output size for its own pixels)
-const uint32_t kShotW = getenv("RX_VK_SHOT_W") ? (uint32_t)atoi(getenv("RX_VK_SHOT_W")) : 1280,
-               kShotH = getenv("RX_VK_SHOT_H") ? (uint32_t)atoi(getenv("RX_VK_SHOT_H")) : 720;
+uint32_t shot_dimension(const char* text, uint32_t fallback) {
+    if (!text) return fallback;
+    if (!*text) return 0;
+    uint32_t value = 0;
+    for (; *text; text++) {
+        if (*text < '0' || *text > '9') return 0;
+        const uint32_t digit = (uint32_t)(*text - '0');
+        if (value > (UINT32_MAX - digit) / 10) return 0;
+        value = value * 10 + digit;
+    }
+    return value;
+}
+const uint32_t kShotW = shot_dimension(getenv("RX_VK_SHOT_W"), 1280),
+               kShotH = shot_dimension(getenv("RX_VK_SHOT_H"), 720);
 VkImage shot_image = VK_NULL_HANDLE;
+VkImageView shot_view = VK_NULL_HANDLE;   // (hookshot: RX_VK_SHOT_MENU's menu draws through it)
 VkBuffer made_buf = VK_NULL_HANDLE;   // (RX_VK_SHOT_MADE: a made frame's readback)
 VmaAllocation made_buf_alloc = nullptr;
 void* made_map = nullptr;
+VkImage made_image = VK_NULL_HANDLE;
+VmaAllocation made_image_alloc = nullptr;
 VmaAllocation shot_image_alloc = nullptr;
 
+bool shot_dimensions_ready() {
+    static int state = 0;
+    if (state) return state > 0;
+    state = -1;
+    const uint32_t limit = dev.props.limits.maxImageDimension2D;
+    const uint64_t pixels = (uint64_t)kShotW * kShotH, row = (uint64_t)kShotW * 3 + 1;
+    bool valid = false;
+    if (kShotW && kShotH && kShotW <= limit && kShotH <= limit && pixels <= SIZE_MAX / 4) {
+        const uint64_t raw = row * kShotH;
+        // write_png emits one IDAT: zlib header, stored blocks (5 bytes per65535), and Adler32.
+        // PNG chunks are limited to2^31-1 bytes. This is an encoder limit, not a memory budget.
+        constexpr uint64_t max_chunk = 0x7fffffffu;
+        if (raw <= max_chunk) {
+            const uint64_t encoded = 2 + raw + 5 * ((raw + 65534) / 65535) + 4;
+            valid = encoded <= max_chunk && encoded <= SIZE_MAX - 4;
+        }
+    }
+    if (!valid) {
+        logf("vk: screenshots disabled: RX_VK_SHOT_W/H must be positive decimal dimensions within the device limit "
+             "(%u) and the PNG/readback size limits (got %ux%u)", limit, kShotW, kShotH);
+        return false;
+    }
+    state = 1;
+    return true;
+}
+
+bool made_shot_init() {
+    if (made_image) return true;
+    VkImage next_image = VK_NULL_HANDLE;
+    VmaAllocation next_alloc = nullptr, next_buf_alloc = nullptr;
+    VkBuffer next_buf = VK_NULL_HANDLE;
+    void* next_map = nullptr;
+    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.imageType = VK_IMAGE_TYPE_2D;
+    ci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ci.extent = {kShotW, kShotH, 1};
+    ci.mipLevels = ci.arrayLayers = 1;
+    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (!create_image(ci, next_image, next_alloc)) return false;
+    if (!create_buffer((uint64_t)kShotW * kShotH * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true,
+                       next_buf, next_buf_alloc, &next_map)) {
+        destroy_image(next_image, next_alloc);
+        return false;
+    }
+    made_image = next_image, made_image_alloc = next_alloc;
+    made_buf = next_buf, made_buf_alloc = next_buf_alloc, made_map = next_map;
+    return true;
+}
+
 bool offscreen_init() {
+    if (!shot_dimensions_ready()) return false;
     if (off_image) return true;
+    VkImage next_off = VK_NULL_HANDLE, next_shot = VK_NULL_HANDLE;
+    VkImageView next_view = VK_NULL_HANDLE;
+    VmaAllocation next_off_alloc = nullptr, next_shot_alloc = nullptr, next_allocs[2]{};
+    VkBuffer next_bufs[2]{};
+    void* next_maps[2]{};
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ci.imageType = VK_IMAGE_TYPE_2D;
     ci.format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -2346,13 +2439,33 @@ bool offscreen_init() {
     ci.mipLevels = ci.arrayLayers = 1;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    if (!create_image(ci, off_image, off_alloc)) return false;
+    bool ok = create_image(ci, next_off, next_off_alloc);
     ci.extent = {kShotW, kShotH, 1};
-    if (!create_image(ci, shot_image, shot_image_alloc)) return false;
+    ci.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;   // (hookshot: RX_VK_SHOT_MENU draws the menu over it, vk_menu.cpp)
+    ok = ok && create_image(ci, next_shot, next_shot_alloc);
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = next_shot;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = ci.format;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    ok = ok && vkCreateImageView(dev.device, &vi, nullptr, &next_view) == VK_SUCCESS;
     for (int i = 0; i < 2; i++)
-        if (!create_buffer((uint64_t)kShotW * kShotH * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, shot_bufs[i],
-                           shot_allocs[i], &shot_maps[i]))
-            return false;
+        ok = ok && create_buffer((uint64_t)kShotW * kShotH * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true,
+                                 next_bufs[i], next_allocs[i], &next_maps[i]);
+    if (!ok) {
+        for (int i = 0; i < 2; i++)
+            if (next_bufs[i]) destroy_buffer(next_bufs[i], next_allocs[i]);
+        if (next_view) vkDestroyImageView(dev.device, next_view, nullptr);
+        if (next_shot) destroy_image(next_shot, next_shot_alloc);
+        if (next_off) destroy_image(next_off, next_off_alloc);
+        return false;
+    }
+    // Publish the ready marker only after both images, the menu view and both mapped readbacks exist.
+    off_image = next_off, off_alloc = next_off_alloc;
+    shot_image = next_shot, shot_image_alloc = next_shot_alloc;
+    shot_view = next_view;
+    for (int i = 0; i < 2; i++)
+        shot_bufs[i] = next_bufs[i], shot_allocs[i] = next_allocs[i], shot_maps[i] = next_maps[i];
     return true;
 }
 
@@ -2373,14 +2486,21 @@ void image_barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkIma
 }
 
 /// The crop of src (x, y, w, h; w 0: all of it) scaled into a rectangle of dst.
+/// An empty source clears the whole destination image; current callers give that fallback a full-image rectangle.
 void blit_crop_to_rect(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImage dst,
                        VkImageLayout dst_layout, PresentRect rect) {
-    int x0 = 0, y0 = 0, x1 = (int)sw, y1 = (int)sh;
-    if (crop && crop[2] > 0 && crop[3] > 0) x0 = crop[0], y0 = crop[1], x1 = crop[0] + crop[2], y1 = crop[1] + crop[3];
+    const PresentSourceRect source = present_source_rect(sw, sh, crop);
+    if (!rect.w || !rect.h) return;
+    if (!source.w || !source.h) {
+        const VkClearColorValue black{{0.0f, 0.0f, 0.0f, 1.0f}};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cmd, dst, dst_layout, &black, 1, &range);
+        return;
+    }
     VkImageBlit b{};
     b.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    b.srcOffsets[0] = {x0, y0, 0};
-    b.srcOffsets[1] = {std::min(x1, (int)sw), std::min(y1, (int)sh), 1};
+    b.srcOffsets[0] = {(int)source.x, (int)source.y, 0};
+    b.srcOffsets[1] = {(int)(source.x + source.w), (int)(source.y + source.h), 1};
     b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     b.dstOffsets[0] = {(int)rect.x, (int)rect.y, 0};
     b.dstOffsets[1] = {(int)(rect.x + rect.w), (int)(rect.y + rect.h), 1};
@@ -2394,15 +2514,17 @@ void blit_crop(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, const
 }
 
 // ---- PNG (stored deflate blocks: no compression library needed) ----
-uint32_t crc_table[256];
 uint32_t crc32(const uint8_t* p, size_t n, uint32_t c = 0xFFFFFFFFu) {
-    if (!crc_table[1])
+    static const std::array<uint32_t, 256> table = [] {
+        std::array<uint32_t, 256> out{};
         for (uint32_t i = 0; i < 256; i++) {
             uint32_t k = i;
             for (int j = 0; j < 8; j++) k = k & 1 ? 0xEDB88320u ^ (k >> 1) : k >> 1;
-            crc_table[i] = k;
+            out[i] = k;
         }
-    for (size_t i = 0; i < n; i++) c = crc_table[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+        return out;
+    }();
+    for (size_t i = 0; i < n; i++) c = table[(c ^ p[i]) & 0xFF] ^ (c >> 8);
     return c;
 }
 } // namespace
@@ -2418,51 +2540,107 @@ uint32_t crc32(const uint8_t* p, size_t n, uint32_t c = 0xFFFFFFFFu) {
                  "to it runs any more (on Linux, dmesg or journalctl -k around this time names the reset)");
 }
 
-void write_png(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h) {
-    std::vector<uint8_t> raw;
-    raw.reserve((size_t)(w * 3 + 1) * h);
-    for (uint32_t y = 0; y < h; y++) {
-        raw.push_back(0);
-        for (uint32_t x = 0; x < w; x++) {
-            const uint8_t* q = rgba + ((size_t)y * w + x) * 4;
-            raw.insert(raw.end(), q, q + 3);
-        }
-    }
-    std::vector<uint8_t> z = {0x78, 0x01};
-    uint32_t a = 1, b = 0;
-    for (uint8_t c : raw) a = (a + c) % 65521, b = (b + a) % 65521;
-    for (size_t at = 0; at < raw.size();) {
-        const size_t n = std::min<size_t>(65535, raw.size() - at);
-        z.push_back(at + n == raw.size() ? 1 : 0);
-        z.push_back((uint8_t)n), z.push_back((uint8_t)(n >> 8));
-        z.push_back((uint8_t)~n), z.push_back((uint8_t)(~n >> 8));
-        z.insert(z.end(), raw.begin() + (long)at, raw.begin() + (long)(at + n));
-        at += n;
-    }
-    const uint32_t adler = b << 16 | a;
-    for (int i = 3; i >= 0; i--) z.push_back((uint8_t)(adler >> (i * 8)));
-    FILE* f = fopen(path, "wb");
-    if (!f) return;
-#ifdef __PROSPERO__
-    std::vector<char> whole(z.size() + 4096);   // (PS5: one write for the file; each write to the title folder costs ~60 ms)
-    setvbuf(f, whole.data(), _IOFBF, whole.size());
-#endif
-    auto be32 = [&](uint32_t v) { uint8_t q[4] = {(uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v}; fwrite(q, 1, 4, f); };
-    auto chunk = [&](const char* type, const uint8_t* d, size_t n) {
-        be32((uint32_t)n);
-        std::vector<uint8_t> td(type, type + 4);
-        td.insert(td.end(), d, d + n);
-        fwrite(td.data(), 1, td.size(), f);
-        be32(crc32(td.data(), td.size()) ^ 0xFFFFFFFFu);
+bool write_png(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h) {
+    auto failed = [path](const char* phase, unsigned error = 0) {
+        static std::atomic<unsigned> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 8)
+            logf("vk: PNG %s failed (error %u): %s", phase, error, path ? path : "(null)");
+        return false;
     };
-    static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 13, 10, 26, 10};
-    fwrite(sig, 1, 8, f);
-    uint8_t ihdr[13] = {(uint8_t)(w >> 24), (uint8_t)(w >> 16), (uint8_t)(w >> 8), (uint8_t)w,
-                        (uint8_t)(h >> 24), (uint8_t)(h >> 16), (uint8_t)(h >> 8), (uint8_t)h, 8, 2, 0, 0, 0};
-    chunk("IHDR", ihdr, 13);
-    chunk("IDAT", z.data(), z.size());
-    chunk("IEND", nullptr, 0);
-    fclose(f);
+    if (!path || !*path || !rgba || !w || !h || w > 0x7fffffffu || h > 0x7fffffffu)
+        return failed("dimensions/path");
+    const uint64_t pixels = (uint64_t)w * h;
+    if (pixels > SIZE_MAX / 4) return failed("size");
+    const uint64_t raw_size = ((uint64_t)w * 3 + 1) * h;
+    constexpr uint64_t max_chunk = 0x7fffffffu;
+    if (raw_size > max_chunk || 6 + raw_size + 5 * ((raw_size + 65534) / 65535) > max_chunk)
+        return failed("size");
+    try {
+        std::vector<uint8_t> raw;
+        raw.reserve((size_t)(w * 3 + 1) * h);
+        for (uint32_t y = 0; y < h; y++) {
+            raw.push_back(0);
+            for (uint32_t x = 0; x < w; x++) {
+                const uint8_t* q = rgba + ((size_t)y * w + x) * 4;
+                raw.insert(raw.end(), q, q + 3);
+            }
+        }
+        std::vector<uint8_t> z = {0x78, 0x01};
+        uint32_t a = 1, b = 0;
+        for (uint8_t c : raw) a = (a + c) % 65521, b = (b + a) % 65521;
+        for (size_t at = 0; at < raw.size();) {
+            const size_t n = std::min<size_t>(65535, raw.size() - at);
+            z.push_back(at + n == raw.size() ? 1 : 0);
+            z.push_back((uint8_t)n), z.push_back((uint8_t)(n >> 8));
+            z.push_back((uint8_t)~n), z.push_back((uint8_t)(~n >> 8));
+            z.insert(z.end(), raw.begin() + (long)at, raw.begin() + (long)(at + n));
+            at += n;
+        }
+        const uint32_t adler = b << 16 | a;
+        for (int i = 3; i >= 0; i--) z.push_back((uint8_t)(adler >> (i * 8)));
+
+        // Encode before opening a file; only a completed private temporary replaces the destination.
+        static std::atomic<uint64_t> next{0};
+        std::string temporary;
+        FILE* f = nullptr;
+        for (int attempt = 0; attempt < 128; attempt++) {
+            temporary = std::string(path) + ".part." + std::to_string(next.fetch_add(1, std::memory_order_relaxed));
+            f = fopen(temporary.c_str(), "wbx");
+            if (f || errno != EEXIST) break;
+        }
+        if (!f) return failed("open", errno);
+#ifdef __PROSPERO__
+        std::vector<char> whole(z.size() + 4096);   // (PS5: one write for the file; each write to the title folder costs ~60 ms)
+        setvbuf(f, whole.data(), _IOFBF, whole.size());
+#endif
+        bool ok = true;
+        unsigned error = 0;
+        const char* phase = "write";
+        auto put = [&](const void* bytes, size_t n) {
+            if (ok && n && fwrite(bytes, 1, n, f) != n) {
+                error = errno ? errno : EIO;
+                ok = false;
+            }
+        };
+        auto be32 = [&](uint32_t v) {
+            const uint8_t q[4] = {(uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v};
+            put(q, sizeof q);
+        };
+        auto chunk = [&](const char* type, const uint8_t* d, size_t n) {
+            be32((uint32_t)n);
+            put(type, 4);
+            put(d, n);
+            be32(crc32(d, n, crc32((const uint8_t*)type, 4)) ^ 0xFFFFFFFFu);
+        };
+        static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 13, 10, 26, 10};
+        put(sig, sizeof sig);
+        const uint8_t ihdr[13] = {(uint8_t)(w >> 24), (uint8_t)(w >> 16), (uint8_t)(w >> 8), (uint8_t)w,
+                                 (uint8_t)(h >> 24), (uint8_t)(h >> 16), (uint8_t)(h >> 8), (uint8_t)h, 8, 2, 0, 0, 0};
+        chunk("IHDR", ihdr, sizeof ihdr);
+        chunk("IDAT", z.data(), z.size());
+        chunk("IEND", nullptr, 0);
+        if (fclose(f) != 0) {
+            if (ok) phase = "close", error = errno ? errno : EIO;
+            ok = false;
+        }
+        if (ok) {
+            phase = "publish";
+#ifdef _WIN32
+            ok = MoveFileExA(temporary.c_str(), path, MOVEFILE_REPLACE_EXISTING) != 0;
+            if (!ok) error = GetLastError();
+#else
+            ok = rename(temporary.c_str(), path) == 0;
+            if (!ok) error = errno;
+#endif
+        }
+        if (!ok) {
+            if (remove(temporary.c_str()) != 0) failed("temporary cleanup", errno);
+            return failed(phase, error);
+        }
+        return true;
+    } catch (const std::exception&) {
+        return failed("encoding allocation");
+    }
 }
 
 namespace {
@@ -2673,7 +2851,7 @@ void status_tick() {
     }
     char dlss[320] = "";
     const bool line = frames % sl::kEvery == 0;
-    const int mode = line ? dlss_status(dlss, sizeof dlss) : dlss_mode();   // (dlss_status: since the last line, so only for one)
+    const int mode = line ? temporal_status(dlss, sizeof dlss) : temporal_mode();   // (temporal_status: since the last line, so only for one)
     static bool over = false;
     if (known && sl::crossed(over, used, allowed)) {
         char w[200];
@@ -2689,10 +2867,22 @@ void status_tick() {
 
 std::atomic<bool> present_native_pq{false};   // (do_present: the game's picture is already HDR10)
 uint64_t present_value = 0;   // (the present job's value, handed out as it came; 0: the next one)
+struct PendingShot {
+    bool on = false;
+    uint64_t value = 0;
+    int64_t presents = 0;
+    std::shared_ptr<std::vector<uint8_t>> pixels;
+};
+std::shared_ptr<std::vector<uint8_t>> shot_pixels(uint64_t at_value, int64_t at_present) {
+    wait_value(at_value);
+    const uint8_t* const sm = (const uint8_t*)shot_maps[at_present & 1];
+    return std::make_shared<std::vector<uint8_t>>(sm, sm + (size_t)kShotW * kShotH * 4);
+}
 void do_present(const nvn_tex* t, const int crop[4]) {
+    static PendingShot pending;
     // (hookshot) NVIDIA Reflex (vk_reflex.cpp): this frame's simulation ended, its submission starts; on the way out (after the
     // present) the driver's sleep until the next frame should begin
-    dlss_idle();   // (NVIDIA DLSS: its video memory let go once it has not been used for a while)
+    temporal_idle();   // (DLSS, FSR: their video memory let go once not used for a while)
     status_tick();   // (the status line, and the video-memory warning)
     reflex_present_begins();
     struct ReflexSleep { ~ReflexSleep() { reflex_sleep(); } } reflex_sleep_after;
@@ -2835,21 +3025,8 @@ void do_present(const nvn_tex* t, const int crop[4]) {
             static const bool shot_made = getenv("RX_VK_SHOT_MADE") != nullptr;
             uint32_t mw = 0, mh = 0;
             made_src = shot && shot_made && interpolated ? framegen_made_image(&mw, &mh) : VK_NULL_HANDLE;
+            if (made_src && !made_shot_init()) made_src = VK_NULL_HANDLE;
             if (made_src) {
-                static VkImage made_image = VK_NULL_HANDLE;
-                static VmaAllocation made_alloc = nullptr;
-                if (!made_image) {
-                    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-                    ci.imageType = VK_IMAGE_TYPE_2D;
-                    ci.format = VK_FORMAT_R8G8B8A8_UNORM;
-                    ci.extent = {kShotW, kShotH, 1};
-                    ci.mipLevels = ci.arrayLayers = 1;
-                    ci.samples = VK_SAMPLE_COUNT_1_BIT;
-                    ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-                    create_image(ci, made_image, made_alloc);
-                    create_buffer((uint64_t)kShotW * kShotH * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, made_buf,
-                                  made_buf_alloc, &made_map);
-                }
                 image_barrier(r.cmd, made_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                 blit_crop(r.cmd, made_src, mw, mh, nullptr, made_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, kShotW, kShotH);
                 image_barrier(r.cmd, made_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -2857,9 +3034,12 @@ void do_present(const nvn_tex* t, const int crop[4]) {
                 vkCmdCopyImageToBuffer(r.cmd, made_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, made_buf, 1, &c);
             }
             if (shot) {
+                // A pending shot may be two (or more) presents old. Own its pixels before this slot is written again.
+                if (pending.on && (pending.presents & 1) == (presents & 1) && !pending.pixels)
+                    pending.pixels = shot_pixels(pending.value, pending.presents);
                 image_barrier(r.cmd, shot_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                 blit_crop(r.cmd, src, sw, sh, crop, shot_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, kShotW, kShotH);
-                if (shot_menu && dev.offscreen) menu_record(r.cmd, shot_image, (int)(presents % 3), kShotW, kShotH);   // (headless: menu_tick's slot)
+                if (shot_menu && dev.offscreen) menu_record_image(r.cmd, shot_image, shot_view, kShotW, kShotH);   // (headless: the menu over the shot)
                 image_barrier(r.cmd, shot_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
                 const VkBufferImageCopy c{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {kShotW, kShotH, 1}};
                 vkCmdCopyImageToBuffer(r.cmd, shot_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, shot_bufs[presents & 1], 1, &c);
@@ -2937,11 +3117,9 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         // (a shot is read once the GPU reached its frame, at a later present, and written on a thread of its own:
         // waiting for the GPU and encoding the PNG there took the replay ~570 ms a shot, and frequent shots
         // halved the frame rate test runs measured. RX_VK_SHOT_MADE shots are taken at once, as before.)
-        static struct { bool on; uint64_t value; int64_t presents; } pending{};
         auto take = [&](uint64_t at_value, int64_t at_present) {
-            wait_value(at_value);
-            const uint8_t* const sm = (const uint8_t*)shot_maps[at_present & 1];
-            auto px = std::make_shared<std::vector<uint8_t>>(sm, sm + (size_t)kShotW * kShotH * 4);
+            auto px = pending.on && pending.presents == at_present && pending.pixels
+                          ? std::move(pending.pixels) : shot_pixels(at_value, at_present);
             // (RX_VK_DUMP_BLACK=<n>: a shot with 12-90% pure black pixels in a lit picture, or a green cast over it,
             // dumps the next frame, n times at most: the glitches some scenes show now and then)
             static int black_left = getenv("RX_VK_DUMP_BLACK") ? atoi(getenv("RX_VK_DUMP_BLACK")) : 0;
@@ -2982,15 +3160,25 @@ void do_present(const nvn_tex* t, const int crop[4]) {
             if (flash) {
                 constexpr uint32_t W = 64, H = 36;
                 auto small = std::make_shared<std::vector<uint8_t>>(W * H * 3);
-                for (uint32_t y = 0; y < H; y++)
-                    for (uint32_t x = 0; x < W; x++)
+                for (uint32_t y = 0; y < H; y++) {
+                    const uint32_t y0 = (uint64_t)y * kShotH / H;
+                    const uint32_t y1 = std::max(y0 + 1, (uint32_t)((uint64_t)(y + 1) * kShotH / H));
+                    for (uint32_t x = 0; x < W; x++) {
+                        const uint32_t x0 = (uint64_t)x * kShotW / W;
+                        const uint32_t x1 = std::max(x0 + 1, (uint32_t)((uint64_t)(x + 1) * kShotW / W));
                         for (int ch = 0; ch < 3; ch++) {
-                            uint32_t sum = 0;
-                            for (uint32_t yy = 0; yy < kShotH / H; yy += 4)
-                                for (uint32_t xx = 0; xx < kShotW / W; xx += 4)
-                                    sum += (*px)[((size_t)(y * (kShotH / H) + yy) * kShotW + x * (kShotW / W) + xx) * 4 + ch];
-                            (*small)[(y * W + x) * 3 + ch] = (uint8_t)(sum / ((kShotH / H / 4) * (kShotW / W / 4)));
+                            uint64_t sum = 0, samples = 0;
+                            // Partition the full image and count the samples actually visited. A partial
+                            // stride must not brighten the cell or wrap its mean back through uint8.
+                            for (uint32_t yy = y0; yy < y1; yy += 4)
+                                for (uint32_t xx = x0; xx < x1; xx += 4) {
+                                    sum += (*px)[((size_t)yy * kShotW + xx) * 4 + ch];
+                                    samples++;
+                                }
+                            (*small)[(y * W + x) * 3 + ch] = (uint8_t)(sum / samples);
                         }
+                    }
+                }
                 static std::shared_ptr<std::vector<uint8_t>> sa, sb, pa, pb;
                 static int64_t present_b = -1;
                 static int flashes_left = 400, dumps_left = getenv("RX_VK_FLASH_DUMPS") ? atoi(getenv("RX_VK_FLASH_DUMPS")) : 6;
@@ -3065,8 +3253,8 @@ void do_present(const nvn_tex* t, const int crop[4]) {
             }
             std::string path = std::string(shots) + "/vk_" + std::to_string(1000000 + at_present).substr(1) + ".png";
             std::thread([px, path, at_present] {
-                write_png(path.c_str(), px->data(), kShotW, kShotH);
-                logf("vk: present %lld written to %s", (long long)at_present, path.c_str());
+                if (write_png(path.c_str(), px->data(), kShotW, kShotH))
+                    logf("vk: present %lld written to %s", (long long)at_present, path.c_str());
             }).detach();
         };
         if (pending.on && (shot || completed() >= pending.value)) take(pending.value, pending.presents), pending.on = false;
@@ -3076,7 +3264,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
             snprintf(path, sizeof path, "%s/vk_%06lld_made.png", shots, (long long)presents);
             write_png(path, (const uint8_t*)made_map, kShotW, kShotH);
         } else if (shot) {
-            pending = {true, value, presents};
+            pending = {true, value, presents, {}};
         }
         log_frame_stats();
     }
@@ -3113,10 +3301,51 @@ VmaAllocation log_image_alloc = nullptr;
 std::mutex log_mu;
 std::condition_variable log_cv;
 std::deque<std::vector<uint8_t>> log_queue;
+std::atomic<int> log_state{0};   // 0: not tried; 1: complete sink; -1: disabled after a failure
+void framelog_resources_drop() {
+    for (LogSlot& l : log_slots) {
+        if (l.buf) destroy_buffer(l.buf, l.alloc);
+        l = LogSlot{};
+    }
+    if (log_image) destroy_image(log_image, log_image_alloc);
+    log_image = VK_NULL_HANDLE;
+    log_image_alloc = nullptr;
+}
+void framelog_write(FILE* f) {
+    SetThreadDescription(GetCurrentThread(), L"mkw_vk frame log");
+    for (;;) {
+        std::vector<uint8_t> rec;
+        {
+            std::unique_lock lk(log_mu);
+            log_cv.wait(lk, [] { return !log_queue.empty(); });
+            rec = std::move(log_queue.front());
+            log_queue.pop_front();
+        }
+        const size_t written = fwrite(rec.data(), 1, rec.size(), f);
+        if (written != rec.size() || fflush(f) != 0) {
+            {
+                std::lock_guard lk(log_mu);
+                log_state.store(-1, std::memory_order_release);
+                log_queue.clear();   // (no worker remains to consume these; don't retain the queued CPU pictures)
+            }
+            logf("vk: frame log stopped: %s failed (wrote %zu of %zu bytes)", written == rec.size() ? "flush" : "write",
+                 written, rec.size());
+            fclose(f);
+            return;
+        }
+    }
+}
+void framelog_enqueue(std::vector<uint8_t> rec) {
+    std::lock_guard lk(log_mu);
+    if (log_state.load(std::memory_order_acquire) > 0 && log_queue.size() < 512) {
+        log_queue.push_back(std::move(rec));
+        log_cv.notify_one();
+    }
+}
 bool framelog_ready() {
-    static int state = 0;
+    const int state = log_state.load(std::memory_order_acquire);
     if (state) return state > 0;
-    state = -1;
+    log_state.store(-1, std::memory_order_release);
     if (!framelog_path()) return false;
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ci.imageType = VK_IMAGE_TYPE_2D;
@@ -3125,25 +3354,36 @@ bool framelog_ready() {
     ci.mipLevels = ci.arrayLayers = 1;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    if (!create_image(ci, log_image, log_image_alloc)) return false;
-    for (LogSlot& l : log_slots)
-        if (!create_buffer_cached((uint64_t)kLogW * kLogH * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, l.buf, l.alloc, &l.map)) return false;
-    std::thread([] {
-        SetThreadDescription(GetCurrentThread(), L"mkw_vk frame log");
-        FILE* f = fopen(framelog_path(), "wb");
-        for (;;) {
-            std::vector<uint8_t> rec;
-            {
-                std::unique_lock lk(log_mu);
-                log_cv.wait(lk, [] { return !log_queue.empty(); });
-                rec = std::move(log_queue.front());
-                log_queue.pop_front();
-            }
-            if (f) fwrite(rec.data(), 1, rec.size(), f), fflush(f);
+    if (!create_image(ci, log_image, log_image_alloc)) {
+        framelog_resources_drop();
+        logf("vk: frame log disabled: the readback image could not be made");
+        return false;
+    }
+    for (LogSlot& l : log_slots) {
+        if (!create_buffer_cached((uint64_t)kLogW * kLogH * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, l.buf, l.alloc, &l.map) || !l.map) {
+            framelog_resources_drop();
+            logf("vk: frame log disabled: the complete mapped readback set could not be made");
+            return false;
         }
-    }).detach();
+    }
+    FILE* f = fopen(framelog_path(), "wb");
+    if (!f) {
+        framelog_resources_drop();
+        logf("vk: frame log disabled: cannot open %s", framelog_path());
+        return false;
+    }
+    // Other presenters are serialized by present_image_mu. Publish before the worker can report a failure.
+    log_state.store(1, std::memory_order_release);
+    try {
+        std::thread([f] { framelog_write(f); }).detach();
+    } catch (const std::exception& e) {
+        log_state.store(-1, std::memory_order_release);
+        fclose(f);
+        framelog_resources_drop();
+        logf("vk: frame log disabled: writer thread could not start (%s)", e.what());
+        return false;
+    }
     logf("vk: the frame log writes every frame shown to %s", framelog_path());
-    state = 1;
     return true;
 }
 bool framelog_on() {
@@ -3214,9 +3454,7 @@ void framelog_collect(int slot) {
     }
     static const bool drop = getenv("RX_VK_FRAMELOG_DROP") != nullptr;
     if (drop) return;
-    std::lock_guard lk(log_mu);
-    if (log_queue.size() < 512) log_queue.push_back(std::move(rec));
-    log_cv.notify_one();
+    framelog_enqueue(std::move(rec));
 }
 } // namespace
 std::atomic<uint32_t> present_kind{0};   // (vk_framegen.cpp: 1 while a made frame goes out)
@@ -3296,6 +3534,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     const PresentAspect aspect{src && host && host->aspect_ratio ? host->aspect_ratio() : 0.0f};
     const PresentRect rect = present_rect(sw, sh, crop, dev.swap_extent.width, dev.swap_extent.height, aspect);
+    [[maybe_unused]] uint32_t trace_route = 0; // direct; 1 scaled, 2 clear, 3 HDR conversion
     const bool has_bars = rect.x || rect.y || rect.w != dev.swap_extent.width || rect.h != dev.swap_extent.height;
     if (has_bars) {
         const VkClearColorValue black{0.0f, 0.0f, 0.0f, 1.0f};
@@ -3311,13 +3550,16 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
                   : framegen_hdr(f.cmd, view, sw, sh, crop, rect.w, rect.h))
         : VK_NULL_HANDLE;
     if (hdr_image) {
+        trace_route = 3;
         full_barrier(f.cmd);
         blit_crop_to_rect(f.cmd, hdr_image, rect.w, rect.h, nullptr, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, rect);
     } else if (scaled) {
+        trace_route = 1;
         blit_crop_to_rect(f.cmd, scaled, rect.w, rect.h, nullptr, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, rect);
     } else if (src) {
         blit_crop_to_rect(f.cmd, src, sw, sh, crop, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, rect);
     } else {
+        trace_route = 2;
         const VkClearColorValue black{};
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdClearColorImage(f.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
@@ -3332,7 +3574,41 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
         vkCmdCopyImageToBuffer(f.cmd, log_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, l.buf, 1, &c);
         l.used = true, l.at = prof_now(), l.seq = seq++, l.kind = present_kind.load();
     }
-    menu_record(f.cmd, dst, log_slot, dev.swap_extent.width, dev.swap_extent.height);
+    // Geometry trace: after choosing the actual presentation route, without frame-log pixel readback.
+    static const bool trace_geometry = getenv("RX_VK_PRESENT_LOG") && atoi(getenv("RX_VK_PRESENT_LOG")) != 0;
+    if (trace_geometry) {
+        static PresentGeometryTrace trace;
+        PresentGeometrySample sample;
+        const PresentContentSize content = present_content_size(sw, sh, crop);
+        sample.source = {sw, sh};
+        sample.content = {content.w, content.h};
+        sample.output = {dev.swap_extent.width, dev.swap_extent.height};
+        sample.destination = {rect.x, rect.y, rect.w, rect.h};
+        sample.crop_supplied = crop != nullptr;
+        if (crop) std::copy_n(crop, 4, sample.crop.begin());
+        sample.sampled_view = view != VK_NULL_HANDLE;
+        sample.host_aspect(src && host && host->aspect_ratio, aspect.ratio);
+        sample.kind = src ? std::min(present_kind.load(), 1u) : 2;
+        sample.route = trace_route;
+        sample.filter = opts.upscale;
+        sample.sharpness = opts.sharpness;
+        sample.framegen = opts.framegen;
+        const PresentTraceDecision decision = trace.note(sample);
+        if (decision == PresentTraceDecision::Emit) {
+            const char* kinds[] = {"game", "made", "startup"};
+            const char* routes[] = {"direct", "scaled", "clear", "hdr"};
+            const char* aspects[] = {"unavailable", "invalid", "valid"};
+            logf("vk: present geometry: kind=%s source=%ux%u crop=%s:%d,%d %dx%d content=%ux%u output=%ux%u "
+                 "destination=%u,%u %ux%u host-aspect=%s:%.9g route=%s view=%d filter-request=%d sharpness-request=%d framegen-request=%d",
+                 kinds[sample.kind], sw, sh, crop ? "supplied" : "none", sample.crop[0], sample.crop[1], sample.crop[2], sample.crop[3],
+                 content.w, content.h, sample.output[0], sample.output[1], rect.x, rect.y, rect.w, rect.h,
+                 aspects[sample.aspect_state], sample.aspect, routes[sample.route], int(sample.sampled_view), sample.filter,
+                 sample.sharpness, sample.framegen);
+        } else if (decision == PresentTraceDecision::Limit) {
+            logf("vk: present geometry: limit of %u changes reached; further geometry messages suppressed", PresentGeometryTrace::kLimit);
+        }
+    }
+    menu_record(f.cmd, index, dev.swap_extent.width, dev.swap_extent.height);   // (hookshot) Dear ImGui's overlays, over all of it
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     vkEndCommandBuffer(f.cmd);
     // after the image's acquisition. (Not on the timeline: one queue runs submits in order, and a wait for a value
@@ -3911,11 +4187,11 @@ bool replay_start() {
 }
 
 /// (hookshot) The host's camera jitter (nx2/oot_jitter.py, host/rx_backend.c): the scene's size while a temporal upscaler
-/// draws, NVIDIA DLSS (vk_dlss.cpp) or AMD FSR 3.1 (vk_fsr3_inputs.cpp), whichever it is (one at a time: the Upscaler row);
-/// 0, no jitter, otherwise
+/// draws, NVIDIA DLSS or AMD FSR 4 (vk_temporal.cpp) or AMD FSR 3.1 (vk_fsr3_inputs.cpp), whichever it is (one at a time: the
+/// Upscaler row); 0, no jitter, otherwise
 int jitter_option(int id) {
     const int axis = id - HOS_OPT_DLSS_JITTER_W;
-    const uint32_t d = dlss_jitter_size(axis);
+    const uint32_t d = temporal_jitter_size(axis);
     return (int)(d ? d : fsr3_inputs::jitter_size(axis));
 }
 
@@ -3943,7 +4219,7 @@ void fill_replay_table(MkwVkRenderer& t) {
         if (id == HOS_OPT_HDR_PEAK) return std::clamp(opts.hdr_peak, 400, 10000);
         if (id == HOS_OPT_HDR_WHITE) return std::clamp(opts.hdr_white, 80, 500);
         if (id == HOS_OPT_DISCORD) return opts.discord != 0;
-        return id == 0 ? opts.realtime : id == 1 ? menu_is_open() : id == 2 ? resolution_auto() && !dlss_full_scale() : id == 3 ? (dlss_full_scale() ? 10000 : resolution_scale()) : id == 4 ? opts.pad_background : id == 5 ? opts.text_speed : id == 6 ? opts.mouse_native :
+        return id == 0 ? opts.realtime : id == 1 ? menu_is_open() : id == 2 ? resolution_auto() && !temporal_full_scale() : id == 3 ? (temporal_full_scale() ? 10000 : resolution_scale()) : id == 4 ? opts.pad_background : id == 5 ? opts.text_speed : id == 6 ? opts.mouse_native :
                id == 7 ? opts.mouse_sens : id == 8 ? opts.mouse_invert : id == 9 ? opts.rumble : id == 16 ? opts.invert_cam_x : id == 17 ? opts.invert_cam_y : id == HOS_OPT_GYRO ? opts.gyro : id == HOS_OPT_GYRO_SENS_X ? opts.gyro_sens_x : id == HOS_OPT_GYRO_SENS_Y ? opts.gyro_sens_y : id == HOS_OPT_GYRO_INV_X ? opts.gyro_inv_x : id == HOS_OPT_GYRO_INV_Y ? opts.gyro_inv_y : id == HOS_OPT_GYRO_DEADZONE ? opts.gyro_deadzone :
                id == HOS_OPT_DLSS_JITTER_W || id == HOS_OPT_DLSS_JITTER_H || id == HOS_OPT_DLSS_JITTER_PHASES ? jitter_option(id) : 0;
     };

@@ -42,15 +42,22 @@ constexpr int VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO=1, VK_SUCCESS=0;
 constexpr int VK_PRESENT_MODE_MAILBOX_KHR=1, VK_PRESENT_MODE_IMMEDIATE_KHR=2;
 struct VkSemaphoreCreateInfo { int type; };
 struct Extent { uint32_t width,height; };
-struct Device { int device=1;uint64_t swapchain=0;int swap_format=0;Extent swap_extent{};
+struct Device { int device=1;uint64_t swapchain=0;int swap_format=0;Extent swap_extent{};bool swap_mutable=false;
     std::vector<VkImage> swap_images;std::vector<VkSemaphore> swap_rendered;
     std::atomic<uint64_t> swap_resize{0};std::mutex present_mu; } dev;
+struct { int hdr=0; } opts;   // (the Insert menu's HDR row: present_image remakes the swapchain when it changes)
 unsigned image_count=4, made=0, fail_at=0;uint64_t serial=1000;
 int query_result=0,data_result=0;uint64_t destroyed_swapchain=0;
 bool idle=false, bad_destroy=false; std::set<uint64_t> live,used;
 std::set<uint64_t> chains, retired;
 uint64_t next_chain=0;int create_result=0;bool bad_chain=false;
-struct CreateInfo {uint64_t oldSwapchain=0;unsigned imageUsage=1,minImageCount=4;};
+struct CreateInfo {uint64_t oldSwapchain=0;unsigned imageUsage=1,minImageCount=4,flags=0;const void* pNext=nullptr;};
+// (hookshot: the overlays' mutable sRGB swapchain, vk_main.cpp: its format list, never used by these formats)
+using VkFormat=int;
+constexpr int VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO=2, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT=16,
+    VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR=4;
+struct VkImageFormatListCreateInfo {int sType;const void* pNext=nullptr;uint32_t viewFormatCount=0;const VkFormat* pViewFormats=nullptr;};
+VkFormat unorm_of(VkFormat f) {return f;}
 void reflex_swapchain_info(CreateInfo&) {}
 struct Reflex {uint64_t swapchain=0,swapchain_generation=0;bool latency=false,frame_marked=false;int mode=-1;std::mutex mu;} cached;
 Reflex& rx(){return cached;}
@@ -83,6 +90,7 @@ void queue_flush_locked() {}
 void vkDeviceWaitIdle(int) {idle=true;}
 // (vk_replay.cpp's helper: held submits out, then the device idle; the real one also takes the present queue's own lock)
 void device_wait_idle_locked() {queue_flush_locked();vkDeviceWaitIdle(dev.device);}
+void swap_views_drop() {}   // (hookshot: the overlays' views, vk_main.cpp)
 bool recreate() {
     uint32_t n=0,width=640,height=480; struct {int format=1;} fmt;
     CreateInfo ci;int mode=0;VkResult result;
@@ -181,6 +189,10 @@ int main() {
     if(acquires!=count || dev.swapchain || !dev.swap_resize.load())return 24;
     stale=false;create_result=0;dev.swap_resize.store(0);present_begin();
     if(acquires!=count+1 || !dev.swapchain)return 25; // Null-chain recovery without a resize notification.
+    opts.hdr=1;preflight_fail=true;count=acquires;active=dev.swapchain;present_begin();
+    if(acquires!=count || dev.swapchain!=active || !dev.swap_resize.load())return 27;
+    preflight_fail=false;present_begin();
+    if(acquires!=count+1 || !dev.swapchain || dev.swap_resize.load())return 28;
     if(bad_destroy || bad_chain)return 8;
     reflex_swapchain_destroyed();
     if(cached.swapchain || cached.latency || cached.frame_marked || cached.mode!=-1)return 26;

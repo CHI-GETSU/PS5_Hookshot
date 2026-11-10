@@ -20,6 +20,8 @@ and is not compiled twice.
 
 Usage:  python -I nx2/build.py [--jobs 1] [--only 0,7] [--opt O1] [--no-polls] [--dll] [--lib] [--standalone]
   --only: just these code_NNN.c chunks (to measure); --dll: link hookshot_game.dll; --lib: archive hookshot_game.lib
+  --dry-run: the start-up with no lift, up to the compile; fails if a file the compile reads (the lift's aside) is missing
+
   HOOKSHOT_TIMES=<build_times.json>: make_game.py's record of the earlier builds. With it, this run says which files it
   really rebuilds and how long each took before (@@plan, @@file, @@eta), which the builder windows show as a countdown.
 """
@@ -40,6 +42,7 @@ import kit
 import lifted_c
 import rtgen
 import logo_rgba
+import ui_fonts
 import toolchain
 import version
 import win_manifest
@@ -197,6 +200,10 @@ def ngx_sdk(sdk, linux):
 NGX_SDK = ngx_sdk(os.environ.get("HOOKSHOT_NGX_SDK", ""), LINUX)
 # (llvm-mingw: what NVIDIA's library asks of Microsoft's runtime, linked in with it. Not compiled otherwise)
 NGX_MSVC_RT = "vk_ngx_msvc_rt.cpp"
+# HOOKSHOT_FSR=1: the Vulkan back end with AMD FSR 4 (gpu/vk/vk_fsr4.cpp), from AMD's FSR API headers (third_party/fidelityfx,
+# MIT). AMD's signed DLLs are not part of the build: the user's, loaded at run time. Off without it (make_game.py --fsr sets
+# it; the camera jitter it needs is in every build: nx2/oot_jitter.py)
+FSR = os.environ.get("HOOKSHOT_FSR", "") == "1"
 
 
 def ngx_link(sdk, mingw):
@@ -351,10 +358,13 @@ def tree_ws(pid):
 
 
 def rss_mb(proc):
-    """A running compiler's resident memory in MB (0: not known, or not started yet)"""
+    """A running compiler's resident memory in MB (0: exited, not known, or not started yet)"""
     if proc is None:
         return 0
     try:
+        # A retained Popen can outlive its driver while PID counters still remain.
+        if proc.poll() is not None:
+            return 0
         if os.name == "nt":
             return tree_ws(proc.pid) >> 20
         return tree_rss(proc.pid) >> 20
@@ -691,17 +701,17 @@ def main():
     p.add_argument("--dll", action="store_true")
     p.add_argument("--lib", action="store_true")
     p.add_argument("--standalone", action="store_true")
+    # (CI: a player's build started from the tree the AppImage carries, with no game. Everything up to the compile, without the
+    # lift's files; every other file the compile would read must be there, and nothing is compiled. scripts/linux/check_player_build.sh)
+    p.add_argument("--dry-run", action="store_true")
     a = p.parse_args()
     sa = os.path.join(kit.WORK, "sa")
     gen = os.path.join(sa if a.standalone else kit.WORK, "gen")
     out = os.path.join(sa if a.standalone else kit.WORK, "build")
     obj_dir = os.path.join(out, "obj")
-    # (hookshot) the start-up screen's logo, assets/hookshot.png as RGBA bytes in a header of the build's own (nx2/logo_rgba.py);
-    # its bytes are part of vk_menu.cpp's dependencies
-    gen_dir = os.path.join(out, "gen")
-    logo_text = logo_rgba.write(os.path.join(gen_dir, "hookshot_logo.h")).encode()
+    gen_dir = os.path.join(out, "gen")   # (the logo and the fonts the Vulkan back end compiles in: made with it, below)
     os.makedirs(obj_dir, exist_ok=True)
-    if os.environ.get("RX_VK_ONLY"):   # (the Vulkan back end needs no game: built so with no lift, as the AppImage's is)
+    if os.environ.get("RX_VK_ONLY") or a.dry_run:   # (the Vulkan back end needs no game: built so with no lift, as the AppImage's is)
         os.makedirs(gen, exist_ok=True)
     rt64 = rtgen.write(os.path.join(out, "rt64"))
     cc = toolchain.need(toolchain.find("clang"))
@@ -741,6 +751,8 @@ def main():
             srcs += [os.path.join(NX2_RT, "eden_shim.c"), write_info(out)]
     if os.environ.get("RX_VK_ONLY"):   # (no lift needed: the back end alone)
         srcs = [s for s in srcs if os.path.exists(s)]
+    if a.dry_run:   # (the lift's files: there is no game here)
+        srcs = [s for s in srcs if os.path.dirname(s) != gen]
     # the longest first, so the long ones do not end up alone at the end (compile_cost)
     costs = chunk_costs(gen)
     srcs.sort(key=lambda s: -compile_cost(s, costs))
@@ -816,6 +828,14 @@ def main():
     elif a.standalone and not a.only and vk_headers and spirv_headers:
         cxx = toolchain.need(toolchain.find("clang++"))
         vk = os.path.join(GPU, "vk")
+        # (hookshot) the start-up screen's logo, assets/hookshot.png as RGBA bytes in a header of the build's own (nx2/logo_rgba.py);
+        # its bytes are part of vk_imgui.cpp's dependencies. Only when the back end is compiled here: the AppImage's comes built
+        # (HOOKSHOT_VK_PREBUILT) and carries neither third_party/fonts nor the back end's sources, and a player's build there
+        # stopped at the fonts (FileNotFoundError: LibertinusSans-Regular.ttf, 2026-11-10)
+        logo_text = logo_rgba.write(os.path.join(gen_dir, "hookshot_logo.h")).encode()
+        # (the overlays' bundled fonts, third_party/fonts/libertinus, as a C++ file of the build's own: nx2/ui_fonts.py)
+        fonts_cpp = os.path.join(gen_dir, "ui_fonts.cpp")
+        ui_fonts.write(fonts_cpp)
         # (what the shader caches are good for: what translates shaders, not the whole DLL, so a build that changes something else
         # keeps them)
         stamp = hashlib.sha1(usedforsecurity=False)
@@ -842,38 +862,79 @@ def main():
         # (NVIDIA DLSS, a local build's option: scripts/ngx_sdk.py. Only vk_dlss.cpp sees NVIDIA's headers; without them
         # it is the stubs that say DLSS is not there)
         ngx_flags = ["-DHOOKSHOT_NGX", "-I" + os.path.join(NGX_SDK, "include")] if NGX_SDK else []
+        ngx_deps = tree_headers(os.path.join(NGX_SDK, "include")) if NGX_SDK else b""
         if NGX_SDK:
             print("the Vulkan back end: with NVIDIA DLSS (NVIDIA's NGX SDK in %s)" % NGX_SDK, flush=True)
+        # (AMD FSR 4, a build's option too: only vk_fsr4.cpp sees AMD's headers; without them it is the stubs that say FSR is
+        # not there)
+        fsr_flags = ["-DHOOKSHOT_FSR", "-I" + os.path.join(kit.HERE, "..", "third_party", "fidelityfx")] if FSR else []
+        if FSR:
+            print("the Vulkan back end: with AMD FSR 4 (AMD's FSR API headers, third_party/fidelityfx)", flush=True)
         # (Eden's recompiler and sirit see only their own headers: a change to the back end's vk_*.h does not
         # rebuild their ~500 files; the back end itself depends on everything, suyu's texture decoders included)
         vk_lib_deps = tree_headers(os.path.join(vk, "eden"), os.path.join(vk, "sirit"), os.path.join(vk, "compat"),
                                    os.path.join(GPU, "compat"))
         vdeps = tree_headers(vk, os.path.join(GPU, "render"), os.path.join(GPU, "compat"),
                              os.path.join(GPU, "third_party", "suyu", "video_core", "textures"))
+        # (hookshot) Dear ImGui (third_party/imgui) draws the overlays over the window's image (gpu/vk/vk_imgui.cpp; vk_menu.cpp
+        # draws with it). Its objects see only its own headers; its headers are a dependency of the two files that include them
+        imgui = os.path.normpath(os.path.join(kit.HERE, "..", "third_party", "imgui"))
+        zstd = os.path.normpath(os.path.join(kit.HERE, "..", "third_party", "zstd", "lib"))   # (the game's font files: vk_imgui.cpp)
+        imgui_flags = ["-I" + imgui, "-I" + zstd, "-DIMGUI_IMPL_VULKAN_NO_PROTOTYPES", "-DIMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS",
+                       "-DIMGUI_DISABLE_WIN32_FUNCTIONS", "-DIMGUI_DISABLE_DEMO_WINDOWS", "-DIMGUI_DISABLE_DEBUG_TOOLS"]
+        imgui_deps = b"".join(open(os.path.join(d, f), "rb").read() for d in (imgui, os.path.join(imgui, "backends"), zstd)
+                              for f in sorted(os.listdir(d)) if f.endswith(".h"))
+        imgui_users = ("vk_imgui.cpp", "vk_menu.cpp")
+        for f in ("imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp", "backends/imgui_impl_vulkan.cpp"):
+            vk_jobs.append((cxx, os.path.join(imgui, *f.split("/")),
+                            os.path.join(obj_dir, "vk_imgui_" + os.path.basename(f)[:-4] + ".o"), vflags + imgui_flags, imgui_deps))
+        # (zstd's decoder, third_party/zstd, plain C)
+        zflags = target() + CPU + (["-fPIC"] if LINUX else []) + ["-O2", "-g0", "-DNDEBUG", "-Wno-everything", "-fvisibility=hidden",
+                                                                 "-DZSTD_DISABLE_ASM", "-DZSTD_LEGACY_SUPPORT=0", "-DZSTD_MULTITHREAD=0"]
+        zdeps = b"".join(open(os.path.join(d, f), "rb").read() for d in (zstd, os.path.join(zstd, "common"), os.path.join(zstd, "decompress"))
+                         for f in sorted(os.listdir(d)) if f.endswith(".h"))
+        for f in ("common/debug.c", "common/entropy_common.c", "common/error_private.c", "common/fse_decompress.c", "common/xxhash.c",
+                  "common/zstd_common.c", "decompress/huf_decompress.c", "decompress/zstd_ddict.c", "decompress/zstd_decompress.c",
+                  "decompress/zstd_decompress_block.c"):
+            vk_jobs.append((cc, os.path.join(zstd, *f.split("/")), os.path.join(obj_dir, "vk_zstd_" + os.path.basename(f)[:-2] + ".o"),
+                            zflags, zdeps))
+        # (the bundled fonts, compiled in: nx2/ui_fonts.py's file of the build's own)
+        vk_jobs.append((cxx, fonts_cpp, os.path.join(obj_dir, "vk_ui_fonts.o"), target() + (["-fPIC"] if LINUX else []) + ["-O0", "-g0", "-w"],
+                        b""))
         for src in vk_sources():
             name = os.path.relpath(src, vk).replace(os.sep, "_")[:-4]
             lib = os.path.relpath(src, vk).split(os.sep)[0] in ("eden", "sirit")
             vk_jobs.append((cxx, src, os.path.join(obj_dir, "vk_" + name + ".o"),
                             vflags + ([shader_stamp] if os.path.basename(src) == "vk_shader.cpp" else []) +
                             ([stamp_def] if os.path.basename(src) == "vk_menu.cpp" else []) +
-                            (ngx_flags if os.path.basename(src) == "vk_dlss.cpp" else []),
-                            vk_lib_deps if lib else vdeps + (logo_text if os.path.basename(src) == "vk_menu.cpp" else b"")))
+                            (ngx_flags if os.path.basename(src) == "vk_dlss.cpp" else []) +
+                            (imgui_flags if os.path.basename(src) in imgui_users else []) +
+                            (fsr_flags if os.path.basename(src) == "vk_fsr4.cpp" else []),
+                            vk_lib_deps if lib else vdeps + (logo_text if os.path.basename(src) == "vk_imgui.cpp" else b"") +
+                            (ngx_deps if os.path.basename(src) == "vk_dlss.cpp" else b"") +
+                            (imgui_deps if os.path.basename(src) in imgui_users else b"")))
         if NGX_SDK and not LINUX and toolchain.mingw():
             # (llvm-mingw: NVIDIA's static library was built with Microsoft's compiler for its static runtime (/MT). What it asks
             # of that runtime: the C parts as for the static FFmpeg (host/mingw_msvc_shims.c), the C++ ones in vk_ngx_msvc_rt.cpp)
             vk_jobs.append((cxx, os.path.join(vk, NGX_MSVC_RT), os.path.join(obj_dir, "vk_ngx_msvc_rt.o"), vflags + ngx_flags, vdeps))
             vk_jobs.append((cc, os.path.join(HOST, "mingw_msvc_shims.c"), os.path.join(obj_dir, "vk_ngx_mingw_msvc_shims.o"),
                             target() + ["-O2", "-g0", "-Wno-everything"], b""))
-        if LINUX:   # (its own copy of the Win32 calls on POSIX, and the bit of GDI the Insert menu draws text with)
-            cflags = target() + CPU + ["-fPIC", "-O2", "-g0", "-Wno-everything", "-D_GNU_SOURCE", "-I" + POSIX,
-                                       "-I" + os.path.join(kit.HERE, "..", "third_party", "stb")]
+        if LINUX:   # (its own copy of the Win32 calls on POSIX)
+            cflags = target() + CPU + ["-fPIC", "-O2", "-g0", "-Wno-everything", "-D_GNU_SOURCE", "-I" + POSIX]
             pdeps = tree_headers(POSIX)
-            for f in ("win32_posix.c", "gdi_posix.c"):
+            for f in ("win32_posix.c",):
                 vk_jobs.append((cc, os.path.join(POSIX, f), os.path.join(obj_dir, "vk_posix_" + f[:-2] + ".o"), cflags, pdeps))
         jobs += vk_jobs
     vk_only = bool(os.environ.get("RX_VK_ONLY"))   # (the renderer alone, the game's objects as they are)
     if vk_only:
         jobs = list(vk_jobs)
+    if a.dry_run:   # (the compile starts here: what it would read, said and checked, and nothing compiled)
+        missing = sorted({j[1] for j in jobs if not os.path.isfile(j[1])} |
+                         ({vk_prebuilt} if vk_prebuilt and not os.path.isfile(vk_prebuilt) else set()))
+        print("dry run: %d files to compile besides the lift's, %d missing" % (len(jobs), len(missing)), flush=True)
+        for f in missing:
+            print("    missing: " + f)
+        return 1 if missing else 0
     # (the builder's compile timer: HOOKSHOT_TIMES is make_game.py's record of the earlier builds on this PC. With it,
     # this run says which files it really rebuilds and how long each took before, and the builder shows the rest of the
     # compile as a countdown that follows this PC's own measurements. Run by hand, it prints none of these lines.)
@@ -1016,7 +1077,7 @@ def main():
                 ([ngx_library(NGX_SDK, True)] if NGX_SDK else []) + ["-ldl", "-lpthread", "-lm"]
         else:
             link = [cc] + toolchain.native_target() + toolchain.native_link() + \
-                ["-shared", "-o", vdll, toolchain.link_opt("/map:" + vdll[:-4] + ".map"), "@" + vrsp, "-luser32", "-lgdi32"] +                 (["-lc++", "-lunwind"] if toolchain.mingw() else []) + ngx_link(NGX_SDK, toolchain.mingw())
+                ["-shared", "-o", vdll, toolchain.link_opt("/map:" + vdll[:-4] + ".map"), "@" + vrsp, "-luser32"] +                 (["-lc++", "-lunwind"] if toolchain.mingw() else []) + ngx_link(NGX_SDK, toolchain.mingw())
         r = subprocess.run(link, capture_output=True, text=True)
         if r.returncode:
             undefined = sorted({l.strip() for l in (r.stdout + r.stderr).splitlines() if "undefined symbol" in l})

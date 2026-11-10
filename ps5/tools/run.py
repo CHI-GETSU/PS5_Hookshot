@@ -2,8 +2,9 @@
 
     python3 ps5/tools/run.py NAME [--seconds 120] [--env 'KEY=VALUE' ...] [--deploy]
 
---deploy uploads what changed in dist/PPSA99024 first. The run's switches go to /app0/hookshot_env.txt (written fresh
-for each run, so one run's input script never leaks into the next). PS5_Vulkan's run tool launches the title and
+--deploy uploads what changed in dist/PPSA99024 first. The run's switches go to /app0/hookshot_test_env.txt, which the
+title reads in place of a player's hookshot_env.txt and with none of its limits (host/hos_main.c), and which is taken
+away when the run ends: a player's start never sees a test's input script. PS5_Vulkan's run tool launches the title and
 captures klog; after --seconds this puts /app0/quit-run.txt in the title folder, and the title leaves through the shell
 (host/ps5/win32_ps5.c quit_watch). The run ends early on the title's exit or a crash record. klog and the game's own
 log land in work/runs/NAME.*; a crash's addresses are symbolised against the linked ELF.
@@ -68,7 +69,7 @@ def main():
         print((r.stdout + r.stderr).strip().splitlines()[-1] if (r.stdout + r.stderr).strip() else "deployed", flush=True)
         if r.returncode:
             return r.returncode
-    put(APP + "/hookshot_env.txt", ("\n".join(a.env) + "\n").encode())
+    put(APP + "/hookshot_test_env.txt", ("\n".join(a.env) + "\n").encode())
     f = ftp()
     for stale in ("/ps5_samples.txt",):
         try:
@@ -110,6 +111,16 @@ def main():
     ended, _, _ = rt.run_title(TITLE, r"\[ps5\] exit|fault in the fault handler", a.seconds + 90, log, (), "",
                          os.path.join(ROOT, "work", "ps5", "link", "llvm-pie.elf"), on_line=on_line)
     stop_sent.set()
+    try:   # (the run's switches go with the run)
+        g = ftp()
+        try:
+            g.delete(APP + "/hookshot_test_env.txt")
+        except ftplib.error_reply as e:   # (this server answers a delete with 226, which ftplib takes for an error)
+            if not str(e).startswith("226"):
+                raise
+        g.quit()
+    except ftplib.all_errors as e:
+        print("run: hookshot_test_env.txt is still on the console (%s): remove it before playing" % e, flush=True)
     samples = get(APP + "/ps5_samples.txt")   # (HOS_PS5_SAMPLE: ps5/tools/samples.py names them)
     if samples is not None:
         open(os.path.join(runs, a.name + ".samples"), "wb").write(samples)

@@ -95,7 +95,7 @@ inline std::string percent_text(size_t done, size_t total) {
     return std::to_string(p) + "%";
 }
 
-/// What the start-up screen shows (vk_startup_paint.h draws it)
+/// What the start-up screen shows (vk_menu.cpp draw_startup draws it)
 struct StartupView {
     std::string version;            // ("v2.0.5"; empty: the build's)
     std::string step, title, pct;   // ("STEP 1 OF 2", "Preparing shaders", "32%"); an empty title: the wordmark alone

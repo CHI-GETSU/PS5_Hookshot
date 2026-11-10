@@ -7,7 +7,7 @@
 
 namespace mkwvk::menu_restart {
 
-constexpr int kMax = 8;   // (rows that take a restart: the menu has six)
+constexpr int kMax = 16;   // (rows that take a restart: the menu has ten; a row past kMax would have no slot)
 
 struct State {
     int n = 0;

@@ -22,6 +22,7 @@ enum {
     WM_DPICHANGED = 0x2e0, WM_KILLFOCUS = 8, WM_CANCELMODE = 0x1f, WM_SETCURSOR = 0x20,
     WM_MOVE = 3, WM_SIZE = 5, WM_PAINT = 0xf, WM_ERASEBKGND = 0x14, WM_CLOSE = 0x10,
     VK_ESCAPE = 0x1b, VK_F11 = 0x7a, VK_RETURN = 0xd, HTCLIENT = 1,
+    VK_SHIFT = 0x10, VK_CONTROL = 0x11, VK_MENU = 0x12,
     SC_SCREENSAVE = 0xf140, SCF_ISSECURE = 1, SPI_GETSCREENSAVESECURE = 0x76,
     SC_CLOSE = 0xf060, SC_MONITORPOWER = 0xf170, SC_MAXIMIZE = 0xf030,
     SWP_NOZORDER = 4, SWP_NOACTIVATE = 0x10, RID_INPUT = 0x10000003,
@@ -46,7 +47,18 @@ static LPARAM forwarded_lp;
 static const LRESULT default_result = 1234;
 
 HWND GetForegroundWindow(void) { return foreground; }
+short GetKeyState(int vkey) { (void)vkey; return 0; }
 BOOL IsIconic(HWND w) { CHECK("iconic query targets game", w == game); return iconic; }
+/* (#1532: the display's idle timer reset on WM_TIMER while the game is in front) */
+typedef unsigned long long ULONGLONG;
+typedef unsigned EXECUTION_STATE;
+#define ES_SYSTEM_REQUIRED 0x1u
+#define ES_DISPLAY_REQUIRED 0x2u
+static ULONGLONG tick = 100000;
+static int awake_calls;
+static EXECUTION_STATE awake_flags;
+ULONGLONG GetTickCount64(void) { return tick; }
+EXECUTION_STATE SetThreadExecutionState(EXECUTION_STATE s) { awake_calls++, awake_flags = s; return 0; }
 BOOL SystemParametersInfoA(UINT action, UINT parameter, void *value, UINT flags) {
     CHECK("only read the secure screen saver policy", action == SPI_GETSCREENSAVESECURE);
     CHECK("no profile write/notification flags", parameter == 0 && flags == 0 && value != NULL);
@@ -98,6 +110,25 @@ static HWND GetCapture(void) { unexpected(); return NULL; }
 static BOOL ReleaseCapture(void) { unexpected(); return FALSE; }
 static void menu_press(HWND w, LPARAM lp, LONG bit) { (void)w; (void)lp; (void)bit; unexpected(); }
 static void menu_mouse(HWND w, int open) { (void)w; (void)open; unexpected(); }
+/* (the game's own menus take the mouse while one of them is shown (host/oot_menu.c); never here either) */
+typedef int64_t LONG64;
+typedef struct { LONG x, y; } POINT;
+static int game_menu_open;
+static volatile LONG64 game_menu_seen_ns;
+static volatile LONG gm_wheel, play_wheel;
+static volatile LONG64 play_wheel_ns;
+static LONG gm_mx, gm_my;
+static LONG64 InterlockedCompareExchange64(volatile LONG64 *target, LONG64 value, LONG64 compare) {
+    const LONG64 was = *target;
+    if (was == compare) *target = value;
+    return was;
+}
+static int64_t hos_now_ns(void) { return 0; }
+static void gm_mouse_used(void) { unexpected(); }
+static int gm_cursor_shown(void) { unexpected(); return 1; }
+static void game_menu_press(LPARAM lp, LONG bit) { (void)lp; (void)bit; unexpected(); }
+static void menus_mouse(HWND w, int insert_open, int game_open) { (void)w; (void)insert_open; (void)game_open; unexpected(); }
+static void gm_cursor_off(HWND w) { (void)w; unexpected(); }
 
 /* ACTUAL_WNDPROC */
 
@@ -129,6 +160,18 @@ int main(void) {
     reset(); foreground = (HWND)(uintptr_t)2; call("background game is forwarded", WM_SYSCOMMAND, SC_SCREENSAVE, 0, 0);
     reset(); foreground = NULL; call("unknown foreground is forwarded", WM_SYSCOMMAND, SC_SCREENSAVE, 0, 0);
     reset(); iconic = 1; call("minimized game is forwarded", WM_SYSCOMMAND, SC_SCREENSAVE, 0, 0);
+    /* (#1532) the display kept on: in front, at most once in 30 s, not minimized, not in the background, no ES_CONTINUOUS */
+    reset(); awake_calls = 0;
+    CHECK("timer handled", wndproc(game, WM_TIMER, 1, 0) == 0);
+    CHECK("foreground timer keeps the display on", awake_calls == 1 && awake_flags == (ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED));
+    wndproc(game, WM_TIMER, 1, 0);
+    CHECK("at most once in 30 s", awake_calls == 1);
+    tick += 30000; iconic = 1; wndproc(game, WM_TIMER, 1, 0);
+    CHECK("not while minimized", awake_calls == 1);
+    iconic = 0; foreground = NULL; wndproc(game, WM_TIMER, 1, 0);
+    CHECK("not in the background", awake_calls == 1);
+    foreground = game; wndproc(game, WM_TIMER, 1, 0);
+    CHECK("again after 30 s in front", awake_calls == 2);
     reset(); call("close command is forwarded", WM_SYSCOMMAND, SC_CLOSE, 0, 0);
     reset(); call("monitor power command is forwarded", WM_SYSCOMMAND, SC_MONITORPOWER, 0, 0);
     reset(); call("maximize command is forwarded", WM_SYSCOMMAND, SC_MAXIMIZE, 0, 0);

@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define MKWVK_API_VERSION 11
+#define MKWVK_API_VERSION 12
 enum { HOS_OPT_CHEAT_HEARTS = 32, HOS_OPT_CHEAT_FLIGHT, HOS_OPT_CHEAT_ACTION, HOS_OPT_CHEAT_CAMERA };
 /* (hookshot) the Motion page's rows (host/pad_sdl.c reads them, vk_replay.cpp's option answers them): Motion controls on
    or off, the horizontal's and the vertical's sensitivity in percent, each turned around, and the deadzone (0 to 2) */
@@ -128,6 +128,9 @@ typedef struct MkwVkHost {
     /* (hookshot) the controller face of the button prompts the game was given at its start (host/prompts.c): HOS_PROMPT_*;
        -1 none (the game's own icons), or not chosen yet */
     int (*prompt_face)(void);
+    /* (hookshot) the game's romfs folder (--romfs, or romfs beside the executable): the overlays read the game's own menu font
+       from it (gpu/vk/vk_imgui.cpp), in memory only */
+    const char *(*romfs_dir)(void);
 } MkwVkHost;
 
 /* what the back end gives the executable: the rx_* functions (gpu/render/rx_nvn.h, rx_core) */

@@ -40,8 +40,12 @@ class BcRawTargetTests(unittest.TestCase):
         self.assertIn("VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT | (dev.view_2d_of_3d", branch)
 
     def test_a_refused_bc_image_is_made_again_without_the_attachment_usage_first(self):
-        chain = self.tex[self.tex.index("} else if (!create_image(ci, x.image, x.allocation) &&"):]
+        fallback = self.tex.index("// (a compressed image refused:")
+        begin = self.tex.rfind("} else if (", 0, fallback)
+        self.assertGreaterEqual(begin, 0)
+        chain = self.tex[begin:]
         chain = chain[:chain.index("logf(\"vk: image %ux%ux%u")]
+        self.assertIn("!create_image(ci, x.image, x.allocation", chain)
         attach = chain.index("ci.usage &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT")
         storage = chain.index("ci.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT")
         self.assertLess(attach, storage)

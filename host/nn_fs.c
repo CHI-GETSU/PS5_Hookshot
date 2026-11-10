@@ -311,6 +311,7 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
 static uint64_t read_at(Ctx *c, uint64_t id, int64_t off, uint64_t buf, uint64_t size) {
     Handle *fh = get_handle(c, id);
     uint64_t done = 0;
+    if (!hos_guest_range(buf, size)) return 0;   /* (hookshot: the file's bytes go into guest memory only) */
     static int64_t delay_ns = -1, delay_after_ns;   /* HOS_FS_DELAY_MS=<ms>[,<after s>] (experiment): slower reads */
     if (delay_ns < 0) {
         const char *e = getenv("HOS_FS_DELAY_MS");
@@ -361,7 +362,7 @@ HLE(_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvmRKNS0_10ReadOptionE) {
 }
 /* GetFileSize(long*, FileHandle) */
 HLE(_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE) {
-    LARGE_INTEGER sz;
+    LARGE_INTEGER sz = {0};   /* (hookshot: a folder's handle has no size: 0, not the host stack's bytes) */
     GetFileSizeEx(get_handle(c, ARG(1))->h, &sz);
     G64(ARG(0)) = (uint64_t)sz.QuadPart;
     RET(0);
@@ -373,7 +374,8 @@ HLE(_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE) {
     ov.Offset = (DWORD)ARG(1);
     ov.OffsetHigh = (DWORD)(ARG(1) >> 32);
     DWORD put = 0;
-    WriteFile(fh->h, GP(ARG(2)), (DWORD)ARG(3), &put, &ov);
+    /* (hookshot) from guest memory only, and the whole size: a DWORD cut wrote less than asked and said so */
+    if (ARG(3) <= 0xFFFFFFFFu && hos_guest_range(ARG(2), ARG(3))) WriteFile(fh->h, GP(ARG(2)), (DWORD)ARG(3), &put, &ov);
     RET(put == ARG(3) ? 0 : 0x2EE202);
 }
 HLE(_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl) {

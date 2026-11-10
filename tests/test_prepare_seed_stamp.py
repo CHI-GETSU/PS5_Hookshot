@@ -95,6 +95,28 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < bytes.size(); i++) bytes[i] = (char)(i * 2654435761u >> 13);
     put(seed, bytes);
     later();
+#ifdef _WIN32
+    // FILETIME's native ticks fit; nanoseconds since 1601 do not. Check the
+    // production helpers against the Win32 clocks without signed multiplication.
+    FILETIME before, after;
+    GetSystemTimeAsFileTime(&before);
+    const int64_t clock = file_clock_now();
+    GetSystemTimeAsFileTime(&after);
+    const auto ticks = [](FILETIME t) {
+        ULARGE_INTEGER n; n.LowPart = t.dwLowDateTime; n.HighPart = t.dwHighDateTime;
+        return n.QuadPart;
+    };
+    if (clock < 0 || (uint64_t)clock < ticks(before) || (uint64_t)clock > ticks(after))
+        std::puts("current clock is not in FILETIME ticks"), fails++;
+    HANDLE file = CreateFileA(seed.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    FILETIME written;
+    uint64_t size;
+    int64_t time;
+    if (file == INVALID_HANDLE_VALUE || !GetFileTime(file, nullptr, nullptr, &written) ||
+        !seed_file_id(seed, &size, &time) || time < 0 || (uint64_t)time != ticks(written))
+        std::puts("seed time is not in FILETIME ticks"), fails++;
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+#endif
     double ms = 0;
     want("first start", start(1), PrepareWhy::First);
     want("same seed, same translator", start(1, &ms), PrepareWhy::None);
@@ -162,6 +184,29 @@ int main(int argc, char** argv) {
     if (ms == 0) std::puts("written well before: not hashed"), fails++;
     want("written well before, the next start", start(3, &ms), PrepareWhy::None);
     if (ms != 0) std::puts("written well before, the next start: hashed again"), fails++;
+    // The guard is still two seconds, including when Windows changes time units.
+    stamp_time(std::filesystem::file_time_type::clock::now() - std::chrono::seconds(5));
+    want("five seconds old", start(3, &ms), PrepareWhy::None);
+    want("five seconds old, the next start", start(3, &ms), PrepareWhy::None);
+    if (ms != 0) std::puts("five seconds old: hashed again"), fails++;
+#ifdef _WIN32
+    // Old five-word records stored wrapped nanoseconds. They must hash once and
+    // rewrite the times, without preparing unchanged content again. Unsigned
+    // multiplication constructs those legacy bits without repeating their UB.
+    {
+        PreparedFor had;
+        prepare_check(rec, seed, 3, &had, &ms);
+        const uint64_t old[5] = {had.stamp, had.seed_hash, had.seed_size,
+                                (uint64_t)had.seed_time * 100, (uint64_t)file_clock_now() * 100};
+        FILE* f = fopen(rec.c_str(), "wb");
+        fwrite(old, 8, 5, f);
+        fclose(f);
+    }
+    want("legacy Windows record", start(3, &ms), PrepareWhy::None);
+    if (ms == 0) std::puts("legacy Windows record: not rehashed"), fails++;
+    want("legacy Windows record, the next start", start(3, &ms), PrepareWhy::None);
+    if (ms != 0) std::puts("legacy Windows record: hashed twice"), fails++;
+#endif
     // no seed: the translator alone, as before
     std::filesystem::remove(seed);
     want("no seed, same translator", start(3), PrepareWhy::None);

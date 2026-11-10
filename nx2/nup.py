@@ -20,6 +20,7 @@ A file that is itself zstd in the game (the romfs .zs files) is not one of those
 """
 import argparse
 from contextlib import suppress
+import errno
 import hashlib
 import os
 import re
@@ -27,6 +28,7 @@ import shutil
 import stat
 import struct
 import sys
+from time import monotonic
 
 
 ZSTD = b"\x28\xb5\x2f\xfd"
@@ -270,8 +272,10 @@ class Nup:
                     out = d.decompress(b)
                 except zstandard.ZstdError:   # (the end of the frame, and the next file's bytes after it)
                     break
-                g.write(out)
                 got += len(out)
+                if got > r[2]:
+                    raise SystemExit("a compressed file expanded past its declared size of %d bytes" % r[2])
+                g.write(out)
             if exact and (left or d.unused_data):
                 raise SystemExit("a compressed extent has trailing bytes")
             if r[5] == 1 and not d.eof:
@@ -408,8 +412,58 @@ def extraction_path(out, part, rel, temporary_suffix=".part"):
     return dst
 
 
+class ProgressSink:
+    """Report successful writes without changing the package reader's copy interface."""
+    def __init__(self, output, report):
+        self.output = output
+        self.report = report
+
+    def write(self, data):
+        count = self.output.write(data)
+        self.report(count)
+        return count
+
+
+def file_system(path):
+    """The file system of the volume path is on (NTFS, exFAT, FAT32, ReFS): Windows only, None elsewhere"""
+    if os.name != "nt":
+        return None
+    import ctypes
+    k = ctypes.WinDLL("kernel32")
+    root, name = ctypes.create_unicode_buffer(261), ctypes.create_unicode_buffer(261)
+    if not k.GetVolumePathNameW(path, root, 261) or not k.GetVolumeInformationW(root, None, 0, None, None, None, name, 261):
+        return None
+    return name.value
+
+
+def out_of_space(error, dst, part, rel, size):
+    """A full drive said with the member being written and what its drive reports, to tell a full disk from a write the drive
+    refused with room to spare (issue 1388: 196 GB free on NTFS, stopped at 12 GB). None for any other error"""
+    if not isinstance(error, OSError) or error.errno != errno.ENOSPC:
+        return None
+    folder = os.path.dirname(dst)
+    try:
+        free = "%.1f GB free there" % (shutil.disk_usage(folder).free / 1e9)
+    except OSError:
+        free = "free space unknown"
+    kind = file_system(folder)
+    return OSError(errno.ENOSPC, "No space left on device writing %s/%s (%d bytes): %s%s" % (
+        part, rel, size, free, ", " + kind if kind else ""))
+
+
 def extract(nup, t, out, only=None, quiet=False):
-    total = n = 0
+    total = n = written = 0
+    interval = 2
+    next_report = 0 if quiet else monotonic() + interval
+
+    def progress(size):
+        nonlocal written, next_report
+        written += size
+        now = monotonic()
+        if now >= next_report:
+            print("  %.1f MiB written (%d files completed)" % (written / (1 << 20), n), flush=True)
+            next_report = now + interval
+
     for part in ("exefs", "romfs"):
         if only and part != only:
             continue
@@ -422,17 +476,18 @@ def extract(nup, t, out, only=None, quiet=False):
             g = open(temporary, "wb")
             try:
                 with g:
-                    nup.copy_to(r, g, rel)
+                    nup.copy_to(r, g if quiet else ProgressSink(g, progress), rel)
                 os.replace(temporary, dst)
-            except BaseException:
+            except BaseException as error:
+                full = out_of_space(error, dst, part, rel, r[2])   # (measured before the member's space is freed)
                 # Free the failed member's space without hiding the extraction error.
                 with suppress(OSError):
                     os.unlink(temporary)
+                if full:
+                    raise full from error
                 raise
             total += r[2]
             n += 1
-            if not quiet and n % 5000 == 0:
-                print("  %d files, %.1f GB" % (n, total / 1e9), flush=True)
     return n, total
 
 
@@ -469,19 +524,22 @@ def zstd_start(head):
     return head == ZSTD or (len(head) == 4 and head[1:] == b"\x2a\x4d\x18" and head[0] & 0xf0 == 0x50)
 
 
-def damaged_game_files(romfs):
+def damaged_game_files(romfs, progress=None):
     """The romfs .zs files that do not start as zstd: in the 23.3 GB dumps three of them begin with zeros (the complete
     dump is about 23.8 GB), and the game then leaves out every model that uses one: the Water Temple's walls and floors,
-    the Great Fairy Fountain's floor (#1002, #718, #1259)"""
-    found = []
+    the Great Fairy Fountain's floor (#1002, #718, #1259). progress(done, total), when given, after each file: the files
+    are listed first, then opened one by one (about 100,000, minutes where a virus scanner looks at each one)"""
+    paths = []
     for folder, dirs, files in os.walk(romfs):
         dirs.sort()
-        for name in sorted(files):
-            if name.endswith(".zs"):
-                path = os.path.join(folder, name)
-                with open(path, "rb") as f:
-                    if not zstd_start(f.read(4)):
-                        found.append(path)
+        paths += [os.path.join(folder, name) for name in sorted(files) if name.endswith(".zs")]
+    found = []
+    for i, path in enumerate(paths):
+        with open(path, "rb") as f:
+            if not zstd_start(f.read(4)):
+                found.append(path)
+        if progress:
+            progress(i + 1, len(paths))
     return found
 
 
@@ -508,11 +566,11 @@ def stand_in_for(path, damaged=()):
     return best and best[1]
 
 
-def stand_in_damaged(romfs):
+def stand_in_damaged(romfs, progress=None):
     """Each damaged .zs file in an unpacked romfs replaced by a copy of its stand-in: (damaged, stand-in or None) each.
-    Only for a romfs this tool unpacked: the player's own folder is never written to"""
+    Only for a romfs this tool unpacked: the player's own folder is never written to. progress: damaged_game_files'"""
     done = []
-    damaged = damaged_game_files(romfs)
+    damaged = damaged_game_files(romfs, progress)
     for path in damaged:
         other = stand_in_for(path, set(damaged))
         if other:

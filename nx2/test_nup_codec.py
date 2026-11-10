@@ -2,11 +2,13 @@
 python -I -B nx2/test_nup_codec.py
 """
 import argparse
+from contextlib import redirect_stdout
 import importlib.util
 import io
 from pathlib import Path
 import struct
 import tempfile
+from unittest.mock import patch
 import zstandard
 
 p = argparse.ArgumentParser(description=__doc__)
@@ -67,4 +69,38 @@ with tempfile.TemporaryDirectory(prefix='nup-codec-') as temporary:
         pass
     else:
         raise AssertionError('explicit extent was overread or incomplete frame accepted')
-print('PASS: explicit .zs plaintext, raw game Zstd, legacy detection and truncated extent rejection')
+
+    oversized = compressor.compress(bytes(65536))
+    path.write_bytes(package('oversized.bin', bytes(8), oversized, 1))
+    reader = nup.Nup(str(path))
+    with reader.f:
+        relative, record = next(reader.walk(0))
+        output = io.BytesIO()
+        try:
+            reader.copy_to(record, output, relative)
+        except SystemExit:
+            assert output.tell() == 0, f'wrote {output.tell()} bytes past the declared size'
+        else:
+            raise AssertionError('oversized compressed member accepted')
+    def extract_member(folder, logical, stored, codec, ticks, quiet=False):
+        path.write_bytes(package('member.bin', logical, stored, codec))
+        reader = nup.Nup(str(path))
+        output = io.StringIO()
+        with reader.f, redirect_stdout(output), patch.object(nup, 'monotonic', side_effect=ticks, create=True):
+            assert nup.extract(reader, reader.titles[0], str(folder), only='exefs', quiet=quiet) == (1, len(logical))
+        assert (folder / 'exefs' / 'member.bin').read_bytes() == logical
+        return output.getvalue().splitlines()
+
+    root = Path(temporary)
+    raw = b'x' * (24 << 20)
+    assert extract_member(root / 'raw', raw, raw, 0, [0, 2.25, 2.50, 4.50]) == [
+        '  8.0 MiB written (0 files completed)',
+        '  24.0 MiB written (0 files completed)',
+    ], 'one large member must report bytes before it finishes, without printing for every chunk'
+
+    logical = b'z' * (1 << 20)
+    stored = compressor.compress(logical)
+    assert extract_member(root / 'packed', logical, stored, 1, [0, 3]) == ['  1.0 MiB written (0 files completed)']
+    assert extract_member(root / 'quiet', logical, stored, 1, AssertionError('quiet mode read the clock'), quiet=True) == []
+
+print('PASS: NUP codecs, extent and output limits, and streamed extraction progress')

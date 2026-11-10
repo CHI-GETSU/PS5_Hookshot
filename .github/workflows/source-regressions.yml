@@ -56,7 +56,20 @@ jobs:
         run: python -m pip install --disable-pip-version-check --no-deps zstandard==0.25.0
       - name: Compilers and the SPIR-V validator
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y g++ clang spirv-tools glslang-tools
+        run: sudo apt-get update && sudo apt-get install -y g++ clang spirv-tools
+      - name: Pinned glslang for generated shader comparisons
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # The checked-in shader headers are generated with glslang16.6.0.
+          # Older distro compilers can lower discard differently even for unchanged GLSL.
+          tool_dir="$RUNNER_TEMP/glslang-16.6.0"
+          mkdir -p "$tool_dir"
+          curl -fL --retry 3 -o "$tool_dir/glslang.tar.gz" https://github.com/KhronosGroup/glslang/releases/download/16.6.0/glslang-16.6.0-linux-x86_64-release.tar.gz
+          echo '2c34071f56ecf39d16233294d3739cf43f981fd39080f2fd9dccb782101191ce  '"$tool_dir/glslang.tar.gz" | sha256sum --check --strict
+          tar -xzf "$tool_dir/glslang.tar.gz" -C "$tool_dir"
+          "$tool_dir/bin/glslangValidator" --version
+          echo "$tool_dir/bin" >> "$GITHUB_PATH"
 
       # (the steps below all run when one before them failed, so one run shows every failure)
       - name: Check Windows native source regressions

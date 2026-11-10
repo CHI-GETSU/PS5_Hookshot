@@ -86,14 +86,14 @@ def sources():
             raise SystemExit("vk_menu.cpp: %s is not marked as taking a restart" % row.split(",")[0])
     if "(restart)" in menu:
         raise SystemExit("vk_menu.cpp: a value still says (restart) whatever runs: \"(after restart)\" is added while it differs")
-    if '" (after restart)"' not in menu or "Restart needed: " not in menu:
-        raise SystemExit("vk_menu.cpp: no (after restart) on a changed value, or no Restart needed line")
+    if '"After restart"' not in menu or "Restart needed: " not in menu:
+        raise SystemExit("vk_menu.cpp: no After restart tag on a changed value, or no Restart needed line")
     if "restart_init();" not in function(menu, "void menu_init() {"):
         raise SystemExit("menu_init does not keep the start values")
     if "restart_state.note(" not in function(menu, "void set_row("):
         raise SystemExit("set_row does not tell the restart state of a change")
     tick = function(menu, "void menu_tick() {")
-    for need in ("restart_ask()", "choose_later(", "menu_hit::ask(", "PostMessageA(app_window(), WM_APP + 9", "save();",
+    for need in ("restart_ask()", "choose_later(", "menu_hit::kButton", "PostMessageA(app_window(), WM_APP + 9", "save();",
                  "pipeline_cache_save(true)"):
         if need not in tick:
             raise SystemExit("menu_tick: the restart question lacks " + need)

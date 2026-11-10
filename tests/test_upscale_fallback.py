@@ -124,6 +124,11 @@ void vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice, VkFormat format, VkFo
         p->optimalTilingFeatures &= ~VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
 }
 void end_pass(VkCommandBuffer) {}
+// (the temporal upscaler, off here: upscale_stub offers it the frame first, vk_draw.cpp temporal_rejected_network)
+bool temporal_wanted() { return false; }
+static bool temporal_rejected_network(VkCommandBuffer, uint64_t, Texture *, const nvn_tex *, Texture *, const nvn_tex *) {
+    return false;
+}
 void full_barrier(VkCommandBuffer) {}
 bool dump_on() { return false; }
 void logf(const char *, ...) {}

@@ -178,6 +178,9 @@ bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
 void flush_mapped(VmaAllocation allocation, uint64_t size) {
     if (size) vmaFlushAllocation(vma, allocation, 0, size);
 }
+void flush_mapped_range(VmaAllocation allocation, uint64_t offset, uint64_t size) {
+    if (size) vmaFlushAllocation(vma, allocation, offset, size);
+}
 void invalidate_mapped(VmaAllocation allocation, uint64_t size) {
     if (size) vmaInvalidateAllocation(vma, allocation, 0, size);
 }

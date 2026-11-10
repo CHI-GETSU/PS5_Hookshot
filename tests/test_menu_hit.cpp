@@ -1,5 +1,7 @@
-// The Insert menu's hit-test (gpu/vk/vk_menu_hit.h): where a mouse position falls on the menu, at a scale of 1 (a
-// 720-line window) and 2 (1440 lines), and through a window whose pixels are not the swapchain's.
+// The Insert menu's hit-test (gpu/vk/vk_menu_hit.h): the controls as recorded while drawing (Map::add), and where a mouse
+// position falls on them, in the window image's pixels: the tabs, a row's name and its value's halves, a slider's track and a
+// drag along it, the Controls page's cells, a list line, the restart question's buttons; off the controls and off the menu;
+// through a window whose pixels are not the swapchain's.
 #include "../gpu/vk/vk_menu_hit.h"
 
 #include <cstdio>
@@ -9,205 +11,113 @@
 using namespace mkwvk::menu_hit;
 
 int main() {
-    // the Graphics tab: 11 rows, the Sharpness row (7) a slider; values from x 380 at scale 1
-    int value_l[11];
-    bool slider[11] = {};
-    for (int& v : value_l) v = 380;
-    slider[7] = true;
-    const int w1 = kWidth, h1 = 520;
-    auto at = [&](int x, int y, int s) {
-        int vl[11];
-        for (int i = 0; i < 11; i++) vl[i] = value_l[i] * s;
-        return options(x, y, s, kWidth * s, h1 * s, 4, 11, vl, slider);
-    };
+    Map m;
     Hit h;
-
-    // ---- scale 1: the tabs (side 64, four slots of 88 from 64) ----
-    h = at(100, 60, 1);
+    // ---- the options page of a 1920 x 1080 window: the tab keys, three tabs, rows 40 high every 48 from y 100 ----
+    m.clear(0, 0, 1920, 1080);
+    m.add(0, 0, 640, 87, kTabPrev, -1);
+    m.add(1280, 0, 1920, 87, kTabNext, -1);
+    for (int i = 0; i < 3; i++) m.add(660 + i * 200, 0, 860 + i * 200, 87, kTab, i);
+    for (int i = 0; i < 10; i++) {
+        const float y = 100 + i * 48;
+        if (i == 7) m.add(100, y, 1000, y + 40, kRow, i, 600, 1000, 640, 960);   // (Sharpness: a slider's track 640 to 960)
+        else m.add(100, y, 1000, y + 40, kRow, i, 600, 1000);
+    }
+    h = m.at(100, 40);
+    CHECK("tab key, left", h.part == kTabPrev);
+    h = m.at(1500, 40);
+    CHECK("tab key, right", h.part == kTabNext);
+    h = m.at(700, 40);
     CHECK("tab 0", h.part == kTab && h.index == 0);
-    h = at(200, 60, 1);
+    h = m.at(1000, 40);
     CHECK("tab 1", h.part == kTab && h.index == 1);
-    h = at(300, 60, 1);
+    h = m.at(1200, 40);
     CHECK("tab 2", h.part == kTab && h.index == 2);
-    h = at(380, 60, 1);
-    CHECK("tab 3 (Debug)", h.part == kTab && h.index == 3);
-    CHECK("[Q / LB] is the previous tab", at(40, 60, 1).part == kTabPrev);
-    CHECK("[E / RB] is the next tab", at(450, 60, 1).part == kTabNext);
-    CHECK("the title is no control", at(100, 20, 1).part == kNone);
-
-    // ---- scale 1: the rows (from 84, 28 high) ----
-    h = at(30, 84 + 3 * 28 + 10, 1);
-    CHECK("row 3 by its name", h.part == kRow && h.index == 3 && h.side == 0);
-    h = at(390, 84 + 3 * 28 + 10, 1);
+    h = m.at(200, 110);
+    CHECK("row 0's name", h.part == kRow && h.index == 0 && h.side == 0);
+    h = m.at(650, 110 + 48 * 3);
     CHECK("row 3's value, left half", h.part == kRow && h.index == 3 && h.side == -1);
-    h = at(450, 84 + 3 * 28 + 10, 1);
+    h = m.at(950, 110 + 48 * 3);
     CHECK("row 3's value, right half", h.part == kRow && h.index == 3 && h.side == 1);
-    h = at(30, 84, 1);
-    CHECK("row 0's top line", h.part == kRow && h.index == 0);
-    h = at(30, 84 - 1, 1);
-    CHECK("above the rows", h.part == kNone);
-    CHECK("the row band's left margin", at(7, 84 + 10, 1).part == kNone);
-    CHECK("past the last row", at(30, 84 + 11 * 28 + 2, 1).part == kNone);
-    CHECK("a tab with fewer rows", options(30, 84 + 5 * 28 + 2, 1, w1, h1, 3, 3, value_l, nullptr).part == kNone);
-
-    // ---- scale 1: the slider's track, 200 to 330 ----
-    const int sy = 84 + 7 * 28 + 14;
-    h = at(265, sy, 1);
-    CHECK("the track's middle", h.part == kSlider && h.index == 7 && h.permille == 500);
-    h = at(196, sy, 1);
+    h = m.at(500, 100 + 48 * 2 + 44);
+    CHECK("between two rows: the menu, no control", h.part == kNone && h.index == -1);
+    h = m.at(800, 110 + 48 * 7);
+    CHECK("the slider's track, its middle", h.part == kSlider && h.index == 7 && h.permille == 500);
+    h = m.at(636, 110 + 48 * 7);
     CHECK("just before the track: its start", h.part == kSlider && h.permille == 0);
-    h = at(334, sy, 1);
+    h = m.at(965, 110 + 48 * 7);
     CHECK("just past the track: its end", h.part == kSlider && h.permille == 1000);
-    h = at(340, sy, 1);
-    CHECK("past the grab: the row's name", h.part == kRow && h.side == 0);
-    h = at(265, 84 + 6 * 28 + 14, 1);
-    CHECK("no track on a row without one", h.part == kRow && h.index == 6);
-    CHECK("a drag past the track holds to its ends", slider_drag(100, 1) == 0 && slider_drag(500, 1) == 1000);
-    CHECK("a drag along it", slider_drag(265, 1) == 500);
+    h = m.at(620, 110 + 48 * 7);
+    CHECK("the slider row's value, off the track", h.part == kRow && h.index == 7 && h.side == -1);
+    CHECK("a drag along the track", m.drag(720, 7) == 250);
+    CHECK("a drag past either end", m.drag(100, 7) == 0 && m.drag(1900, 7) == 1000);
+    CHECK("a drag on a row without a track", m.drag(720, 3) == -1);
+    CHECK("the slider's value", slider_value(m.drag(720, 7), 0, 100, 10) == 30 && slider_value(1000, 0, 100, 10) == 100);
+    CHECK("the knob's place", slider_permille(60, 0, 100) == 600 && slider_permille(500, 10, 300) == 1000);
 
-    // ---- the slider's values ----
-    CHECK("sharpness at half", slider_value(500, 0, 100, 10) == 50);
-    CHECK("sharpness ends", slider_value(0, 0, 100, 10) == 0 && slider_value(1000, 0, 100, 10) == 100);
-    CHECK("sensitivity at half (nearest step)", slider_value(500, 10, 500, 10) == 260);
-    CHECK("sensitivity ends", slider_value(0, 10, 500, 10) == 10 && slider_value(1000, 10, 500, 10) == 500);
-    CHECK("knob place", slider_permille(50, 0, 100) == 500 && slider_permille(10, 10, 500) == 0 &&
-                        slider_permille(500, 10, 500) == 1000);
-    CHECK("a value and its knob agree", slider_value(slider_permille(260, 10, 500), 10, 500, 10) == 260);
-
-    // ---- scale 2 (a 1440-line window): everything twice as far ----
-    h = at(400, 120, 2);
-    CHECK("scale 2: tab 1", h.part == kTab && h.index == 1);
-    CHECK("scale 2: [Q / LB]", at(100, 120, 2).part == kTabPrev);
-    h = at(60, 168 + 2 * 56 + 5, 2);
-    CHECK("scale 2: row 2", h.part == kRow && h.index == 2 && h.side == 0);
-    h = at(900, 168 + 2 * 56 + 5, 2);
-    CHECK("scale 2: row 2's value, right half", h.part == kRow && h.side == 1);
-    h = at(530, 168 + 7 * 56 + 28, 2);
-    CHECK("scale 2: the track's middle", h.part == kSlider && h.permille == 500);
-
-    // ---- off the menu ----
-    CHECK("left of the menu", at(-1, 100, 1).part == kOutside);
-    CHECK("right of the menu", at(w1, 100, 1).part == kOutside);
-    CHECK("below the menu", at(100, h1, 1).part == kOutside);
-
-    // ---- the window's pixels to the menu's: a 1280x720 window, the menu centred ----
-    {
-        int ix, iy, x0, y0;
-        to_image(400 + 300, 100 + 60, 1280, 720, 1280, 720, &ix, &iy);
-        origin(1280, 720, w1, h1, &x0, &y0);
-        CHECK("centred at 1280x720", x0 == 400 && y0 == 100);
-        h = options(ix - x0, iy - y0, 1, w1, h1, 4, 11, value_l, slider);
-        CHECK("1280x720: tab 2", h.part == kTab && h.index == 2);
+    // ---- the Controls page: a name and two cells (gamepad, keyboard) a row, Reset to defaults at the end ----
+    m.clear(0, 0, 1920, 1080);
+    for (int i = 0; i < 3; i++) {
+        const float y = 120 + i * 42;
+        m.add(100, y, 400, y + 36, kCtlRow, i);
+        m.add(400, y, 700, y + 36, kCtlCell, i, 0, 0, 0, 0, 0);
+        m.add(700, y, 1000, y + 36, kCtlCell, i, 0, 0, 0, 0, 1);
     }
-    {   // (the swapchain at 2560x1440 while the window still says 1280x720 pixels: a resize on its way)
-        int ix, iy, x0, y0;
-        to_image(640, 160, 1280, 720, 2560, 1440, &ix, &iy);
-        CHECK("window to image", ix == 1280 && iy == 320);
-        origin(2560, 1440, kWidth * 2, h1 * 2, &x0, &y0);
-        h = at(ix - x0, iy - y0, 2);
-        CHECK("2560x1440: tab 2", h.part == kTab && h.index == 2);
-    }
-    {   // (a 1920x1080 window: still scale 1, centred)
-        int x0, y0;
-        origin(1920, 1080, w1, h1, &x0, &y0);
-        h = options(960 - x0, (y0 + 84 + 28 + 5) - y0, 1, w1, h1, 3, 11, value_l, slider);
-        CHECK("1920x1080: row 1", h.part == kRow && h.index == 1);
-    }
+    m.add(100, 120 + 3 * 42, 390, 120 + 3 * 42 + 36, kCtlRow, 3);
+    h = m.at(200, 130 + 42);
+    CHECK("a control's name", h.part == kCtlRow && h.index == 1);
+    h = m.at(500, 130 + 84);
+    CHECK("its gamepad cell", h.part == kCtlCell && h.index == 2 && h.side == 0);
+    h = m.at(800, 130);
+    CHECK("its keyboard cell", h.part == kCtlCell && h.index == 0 && h.side == 1);
+    h = m.at(200, 130 + 126);
+    CHECK("Reset to defaults", h.part == kCtlRow && h.index == 3);
+    m.add(100, 60, 1000, 96, kCtlOption, 1, 600, 1000);   // (a row of the page's own, above the grid: Button prompts)
+    h = m.at(650, 70);
+    CHECK("the page's own row, its value's left half", h.part == kCtlOption && h.index == 1 && h.side == -1);
+    h = m.at(200, 70);
+    CHECK("its name", h.part == kCtlOption && h.side == 0);
 
-    // ---- the Controls page: 2 rows of its own from 44, then (after the column titles) 24 controls and Reset from 110;
-    // rows 22 high ----
-    const int cw = kCtlWidth, ch = 720, gt = ctl_grid_top(2);
-    CHECK("controls: the grid under the page's own rows", gt == 44 + 2 * 22 + 22);
-    h = controls(50, gt + 2 * 22 + 5, 1, cw, ch, 24, 2);
-    CHECK("controls: row 2's name", h.part == kCtlRow && h.index == 2);
-    h = controls(250, gt + 2 * 22 + 5, 1, cw, ch, 24, 2);
-    CHECK("controls: row 2's gamepad", h.part == kCtlCell && h.index == 2 && h.side == 0);
-    h = controls(400, gt + 2 * 22 + 5, 1, cw, ch, 24, 2);
-    CHECK("controls: row 2's keys", h.part == kCtlCell && h.index == 2 && h.side == 1);
-    h = controls(193, gt + 5, 1, cw, ch, 24, 2);
-    CHECK("controls: just before the gamepad's cell", h.part == kCtlRow && h.index == 0);
-    h = controls(250, gt + 24 * 22 + 5, 1, cw, ch, 24, 2);
-    CHECK("controls: Reset to defaults is a row", h.part == kCtlRow && h.index == 24);
-    CHECK("controls: past Reset", controls(250, gt + 25 * 22 + 5, 1, cw, ch, 24, 2).part == kNone);
-    CHECK("controls: the column titles", controls(250, gt - 10, 1, cw, ch, 24, 2).part == kNone);
-    CHECK("controls: the header", controls(250, 30, 1, cw, ch, 24, 2).part == kNone);
-    h = controls(50, 44 + 22 + 5, 1, cw, ch, 24, 2);
-    CHECK("controls: the page's row 1, its name", h.part == kCtlOption && h.index == 1 && h.side == 0);
-    h = controls(250, 44 + 5, 1, cw, ch, 24, 2);
-    CHECK("controls: the page's row 0, its value's left half", h.part == kCtlOption && h.index == 0 && h.side == -1);
-    h = controls(500, 44 + 5, 1, cw, ch, 24, 2);
-    CHECK("controls: the page's row 0, its value's right half", h.part == kCtlOption && h.index == 0 && h.side == 1);
-    h = controls(250, 64 + 2 * 24 + 5, 1, cw, ch, 24);
-    CHECK("controls without rows of its own: the grid from 66", ctl_grid_top(0) == 66 && h.part == kCtlCell);
-    h = controls(800, 2 * (gt + 2 * 22) + 10, 2, cw * 2, ch * 2, 24, 2);
-    CHECK("controls, scale 2: row 2's keys", h.part == kCtlCell && h.index == 2 && h.side == 1);
-    h = controls(1000, 2 * (44 + 22) + 10, 2, cw * 2, ch * 2, 24, 2);
-    CHECK("controls, scale 2: the page's row 1, right half", h.part == kCtlOption && h.index == 1 && h.side == 1);
+    // ---- a list line with an amount (its halves), and one without ----
+    m.clear(0, 0, 1920, 1080);
+    m.add(100, 100, 1000, 130, kListLine, 0, 900, 1000);
+    m.add(100, 134, 1000, 164, kListLine, 1);
+    h = m.at(920, 110);
+    CHECK("an amount, its left half", h.part == kListLine && h.index == 0 && h.side == -1);
+    h = m.at(990, 110);
+    CHECK("an amount, its right half", h.side == 1);
+    h = m.at(990, 140);
+    CHECK("a line without an amount", h.part == kListLine && h.index == 1 && h.side == 0);
 
-    // ---- the Cheats page: 11 rows 28 high from 44; row 4's value from x 420 (none on row 2: the menu's width) ----
-    {
-        int vl[11];
-        for (int& v : vl) v = 420;
-        vl[2] = kWidth;
-        const int cheat_h = 136 + 11 * 28;
-        h = cheats(30, 44 + 4 * 28 + 10, 1, kWidth, cheat_h, 11, vl);
-        CHECK("cheats: row 4's name", h.part == kCheatRow && h.index == 4 && h.side == 0);
-        h = cheats(425, 44 + 4 * 28 + 10, 1, kWidth, cheat_h, 11, vl);
-        CHECK("cheats: row 4's value, left half", h.part == kCheatRow && h.index == 4 && h.side == -1);
-        h = cheats(460, 44 + 4 * 28 + 10, 1, kWidth, cheat_h, 11, vl);
-        CHECK("cheats: row 4's value, right half", h.part == kCheatRow && h.index == 4 && h.side == 1);
-        h = cheats(460, 44 + 2 * 28 + 10, 1, kWidth, cheat_h, 11, vl);
-        CHECK("cheats: a row without a value", h.part == kCheatRow && h.index == 2 && h.side == 0);
-        CHECK("cheats: the title", cheats(30, 43, 1, kWidth, cheat_h, 11, vl).part == kNone);
-        CHECK("cheats: the help below the rows", cheats(30, 44 + 11 * 28 + 2, 1, kWidth, cheat_h, 11, vl).part == kNone);
-        CHECK("cheats: the band's margin", cheats(7, 44 + 10, 1, kWidth, cheat_h, 11, vl).part == kNone);
-        CHECK("cheats: off the menu", cheats(30, cheat_h, 1, kWidth, cheat_h, 11, vl).part == kOutside);
-        int vl2[11];
-        for (int i = 0; i < 11; i++) vl2[i] = vl[i] * 2;
-        h = cheats(60, (44 + 10 * 28 + 3) * 2, 2, kWidth * 2, cheat_h * 2, 11, vl2);
-        CHECK("cheats, scale 2: the last row", h.part == kCheatRow && h.index == 10 && h.side == 0);
-        h = cheats(930, (44 + 4 * 28 + 3) * 2, 2, kWidth * 2, cheat_h * 2, 11, vl2);
-        CHECK("cheats, scale 2: row 4's value, right half", h.part == kCheatRow && h.index == 4 && h.side == 1);
-    }
+    // ---- the restart question: the menu is the dialog; two buttons ----
+    m.clear(680, 424, 1240, 656);
+    m.add(706, 584, 916, 630, kButton, 0);
+    m.add(940, 584, 1150, 630, kButton, 1);
+    h = m.at(800, 600);
+    CHECK("Later", h.part == kButton && h.index == 0);
+    h = m.at(1000, 600);
+    CHECK("Restart now", h.part == kButton && h.index == 1);
+    h = m.at(900, 450);
+    CHECK("the dialog, off its buttons", h.part == kNone);
+    h = m.at(100, 100);
+    CHECK("off the dialog", h.part == kOutside);
 
-    // ---- a list page: 20 lines 24 high from 48 (the line as shown; the menu maps it to its item) ----
-    {
-        int vl[20];
-        for (int& v : vl) v = kWidth;
-        vl[3] = 440;
-        const int list_h = 100 + 20 * 24;
-        h = list_lines(40, 48 + 3 * 24 + 5, 1, kWidth, list_h, 20, vl);
-        CHECK("list: line 3's name", h.part == kListLine && h.index == 3 && h.side == 0);
-        h = list_lines(445, 48 + 3 * 24 + 5, 1, kWidth, list_h, 20, vl);
-        CHECK("list: line 3's amount, left half", h.part == kListLine && h.index == 3 && h.side == -1);
-        h = list_lines(460, 48 + 3 * 24 + 5, 1, kWidth, list_h, 20, vl);
-        CHECK("list: line 3's amount, right half", h.part == kListLine && h.index == 3 && h.side == 1);
-        h = list_lines(460, 48 + 5 * 24 + 5, 1, kWidth, list_h, 20, vl);
-        CHECK("list: a line without an amount", h.part == kListLine && h.index == 5 && h.side == 0);
-        CHECK("list: the heading line above", list_lines(40, 47, 1, kWidth, list_h, 20, vl).part == kNone);
-        CHECK("list: a short list's end", list_lines(40, 48 + 7 * 24 + 5, 1, kWidth, list_h, 7, vl).part == kNone);
-        CHECK("list: the hints", list_lines(40, 48 + 20 * 24 + 5, 1, kWidth, list_h, 20, vl).part == kNone);
-        h = list_lines(80, (48 + 19 * 24 + 2) * 2, 2, kWidth * 2, list_h * 2, 20, nullptr);
-        CHECK("list, scale 2: the last line", h.part == kListLine && h.index == 19 && h.side == 0);
-    }
+    // ---- what was drawn last is on top; the map holds kMax boxes and drops the rest ----
+    m.clear(0, 0, 100, 100);
+    m.add(0, 0, 100, 100, kNone, -1);
+    m.add(10, 10, 20, 20, kButton, 1);
+    h = m.at(15, 15);
+    CHECK("the last drawn, on top", h.part == kButton);
+    for (int i = 0; i < Map::kMax + 10; i++) m.add(0, 0, 1, 1, kRow, i);
+    CHECK("no more than kMax", m.n == Map::kMax);
 
-    // ---- the restart question: Later from 16, Restart now from 182, both 150 wide, 120 to 154 high ----
-    {
-        const int ah = kAskHeight;
-        h = ask(20, 130, 1, kWidth, ah);
-        CHECK("ask: Later", h.part == kButton && h.index == 0);
-        h = ask(331, 153, 1, kWidth, ah);
-        CHECK("ask: Restart now", h.part == kButton && h.index == 1);
-        CHECK("ask: between the buttons", ask(170, 130, 1, kWidth, ah).part == kNone);
-        CHECK("ask: past Restart now", ask(340, 130, 1, kWidth, ah).part == kNone);
-        CHECK("ask: above the buttons", ask(20, 119, 1, kWidth, ah).part == kNone);
-        CHECK("ask: below the buttons", ask(20, 154, 1, kWidth, ah).part == kNone);
-        CHECK("ask: off the page", ask(20, ah, 1, kWidth, ah).part == kOutside);
-        h = ask(190 * 2, 125 * 2, 2, kWidth * 2, ah * 2);
-        CHECK("ask, scale 2: Restart now", h.part == kButton && h.index == 1);
-        h = ask(17 * 2, 153 * 2 + 1, 2, kWidth * 2, ah * 2);
-        CHECK("ask, scale 2: Later", h.part == kButton && h.index == 0);
-    }
+    // ---- a window of 1280 x 720 pixels over a 2560 x 1440 image (the swapchain not yet resized, or a scaled window) ----
+    int ix = 0, iy = 0;
+    to_image(640, 360, 1280, 720, 2560, 1440, &ix, &iy);
+    CHECK("to the image's pixels", ix == 1280 && iy == 720);
+    to_image(5, 7, 0, 0, 2560, 1440, &ix, &iy);
+    CHECK("no window size: as it is", ix == 5 && iy == 7);
 
-    std::puts("menu hit-test: all checks passed");
+    std::printf("PASS: the hit-test over the controls as drawn\n");
+    return 0;
 }

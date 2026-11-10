@@ -21,6 +21,7 @@
 #include "gpu_choice.h"
 #include "vk_menu.h"
 #include "vk_dlss.h"
+#include "vk_fsr4.h"
 #include "vk_reflex.h"
 #include "vk_progress.h"
 
@@ -274,7 +275,10 @@ bool create_device() {
         optional(VK_AMD_BUFFER_MARKER_EXTENSION_NAME, dev.buffer_marker);
     optional(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, dev.device_fault);
     optional(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, dev.coop_matrix);
+    optional(VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME, dev.swap_mutable);   // (hookshot: the overlays, vk_imgui.cpp)
     dlss_device_extensions(want, exts);   // (hookshot: NVIDIA DLSS's, vk_dlss.cpp)
+    bool fsr_descriptor_buffer = false;   // (hookshot, linux: only with a Vulkan FSR 4 library beside the game, vk_fsr4.cpp)
+    if (fsr4_wants_descriptor_buffer()) optional(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME, fsr_descriptor_buffer);
     reflex_device_extensions(want, exts);   // (hookshot: NVIDIA Reflex's, vk_reflex.cpp)
 
     // the queue: one family for graphics, compute and transfer
@@ -355,8 +359,11 @@ bool create_device() {
     if (dev.view_2d_of_3d) *tail = &v2d3d, tail = &v2d3d.pNext;
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     if (dev.coop_matrix) *tail = &coop, tail = &coop.pNext;
+    VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptor_buffer{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
+    if (fsr_descriptor_buffer) *tail = &descriptor_buffer, tail = &descriptor_buffer.pNext;
     reflex_device_features(tail);   // (present ids, when NVIDIA Reflex's extensions are there)
     vkGetPhysicalDeviceFeatures2(dev.physical, &f);
+    descriptor_buffer.descriptorBufferCaptureReplay = VK_FALSE;
     dev.view_2d_of_3d = dev.view_2d_of_3d && v2d3d.sampler2DViewOf3D;
     coop.cooperativeMatrixRobustBufferAccess = VK_FALSE;
     dev.coop_matrix = dev.coop_matrix && coop.cooperativeMatrix &&
@@ -473,6 +480,38 @@ bool create_device() {
 
 } // namespace
 
+/// (hookshot) The UNORM format of an sRGB one (the same bytes, read and written as they are), else the format itself
+VkFormat unorm_of(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+    case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+    case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    default: return f;
+    }
+}
+/// (hookshot) The views of the swapchain's images let go (before the swapchain they view: the device idle already)
+void swap_views_drop() {
+    for (auto view : dev.swap_views)
+        if (view) vkDestroyImageView(dev.device, view, nullptr);
+    dev.swap_views.clear();
+}
+/// (hookshot) A view of each of the swapchain's images, for Dear ImGui's overlays (vk_imgui.cpp), when they can be drawn into,
+/// in the format given (the swapchain's, or its UNORM one when the swapchain was made mutable)
+void swap_views_make(VkImageUsageFlags usage, VkFormat format) {
+    swap_views_drop();
+    dev.swap_views.assign(dev.swap_images.size(), VK_NULL_HANDLE);
+    dev.swap_view_format = format;
+    if (!(usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) return;
+    for (size_t i = 0; i < dev.swap_images.size(); i++) {
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = dev.swap_images[i];
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = format;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(dev.device, &vi, nullptr, &dev.swap_views[i]) != VK_SUCCESS) dev.swap_views[i] = VK_NULL_HANDLE;
+    }
+}
+
 bool create_swapchain(uint32_t width, uint32_t height) {
     VkSurfaceCapabilitiesKHR caps;
     VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(dev.physical, dev.surface, &caps);
@@ -564,6 +603,9 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     // The renderer copies into swapchain images. Readback is optional and only available on surfaces that allow it.
     if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
         ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    // (hookshot) the overlays Dear ImGui draws (vk_imgui.cpp) render into it. Every surface allows it (the Vulkan spec)
+    if (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+        ci.imageUsage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     if (!(caps.supportedCompositeAlpha & ci.compositeAlpha)) {
@@ -581,6 +623,18 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     }
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = dev.swapchain;
+    // (hookshot) an sRGB swapchain (some drivers list no UNORM format) made mutable when the driver can: the overlays draw
+    // through UNORM views, their colours as they are, as on a UNORM swapchain. Without it, vk_imgui.cpp makes them linear
+    const VkFormat view_formats[2] = {fmt.format, unorm_of(fmt.format)};
+    VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+    const bool mutable_view = dev.swap_mutable && view_formats[1] != fmt.format && (ci.imageUsage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    if (mutable_view) {
+        ci.flags |= VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR;
+        format_list.viewFormatCount = 2;
+        format_list.pViewFormats = view_formats;
+        format_list.pNext = ci.pNext;
+        ci.pNext = &format_list;
+    }
     reflex_swapchain_info(ci);   // (NVIDIA Reflex: latency mode on)
     VkSwapchainKHR sc;
     result = vkCreateSwapchainKHR(dev.device, &ci, nullptr, &sc);
@@ -588,6 +642,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     if (dev.swapchain) {
         device_wait_idle_locked();   // (the present queue's presents of the old swapchain done too)
         reflex_swapchain_destroyed();   // (no latency sleep or markers may use the destroyed chain)
+        swap_views_drop();   // (hookshot: the overlays' views of its images, before it)
         for (auto semaphore : dev.swap_rendered) vkDestroySemaphore(dev.device, semaphore, nullptr);
         vkDestroySwapchainKHR(dev.device, dev.swapchain, nullptr);
         dev.swapchain = VK_NULL_HANDLE;
@@ -626,6 +681,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     dev.swap_images = std::move(images);
     logf("vk: swapchain %ux%u, %u images, %s", width, height, n,
          mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo");
+    swap_views_make(ci.imageUsage, mutable_view ? view_formats[1] : fmt.format);
     reflex_swapchain_created(sc);   // (NVIDIA Reflex: its sleep mode on the new swapchain)
     return true;
 }
@@ -738,6 +794,21 @@ void prepare_with_screen() {
             if (finished || paint_stop.load()) break;
             Sleep(33);
         }
+        // (the end: a fade to black over 0.4 s, so the game's first frame comes out of black, not cut in over the screen; none
+        // after a screen of under 1.5 s, a blink, or when the window is not shown (paint_stop: its presents wait))
+        const double shown = std::chrono::duration<double>(clock::now() - t0).count();
+        if (shown >= 1.5 && !paint_stop.load()) {
+            const auto f0 = clock::now();
+            for (;;) {
+                const double f = std::chrono::duration<double>(clock::now() - f0).count() / 0.4;
+                startup_fade_to((float)std::min(f, 1.0));
+                uint32_t w, h;
+                window_size(&w, &h);
+                if (w && h) present_image(nullptr, dev.swap_extent.width, dev.swap_extent.height, nullptr);
+                if (f >= 1 || paint_stop.load()) break;
+                Sleep(8);
+            }
+        }
         SetEvent(painted);
     });
     // (this thread: the window's messages on Windows, until the work is done)
@@ -752,9 +823,10 @@ void prepare_with_screen() {
         if (WaitForSingleObject(prep_ended, 33) == WAIT_OBJECT_0) break;
     }
     worker.join();
-    paint_stop.store(true);
-    if (WaitForSingleObject(painted, 1000) == WAIT_OBJECT_0) painter.join();
-    else {   // (its present waits for the window to be seen: the game's own presents will, too)
+    // (the painter ends by itself once the work is finished, after its fade; it is told to stop only when it has not by then)
+    if (WaitForSingleObject(painted, 1500) == WAIT_OBJECT_0) painter.join();
+    else {
+        paint_stop.store(true);   // (its present waits for the window to be seen: the game's own presents will, too)
         logf("vk: start-up: the window is not being shown; the game starts without waiting for it");
         painter.detach();
     }

@@ -75,7 +75,15 @@ volatile int hos_oot_live_action;
 int hos_oot_flight_shortcut_ready(void) { CHECK(!"unexpected cheat readiness query"); return 0; }
 void rx_option_set(int id, int value) { (void)id; (void)value; CHECK(!"unexpected cheat option change"); }
 """
-    actual = "\n".join((cheat_state, cheat_spies, block(hid, "static int key("), block(hid, "static int kmap_down("),
+    # (the host's own presses and stick, for the game's menus' mouse (host/oot_menu.c): none here; the player's input
+    # time it hides the mouse by: not looked at)
+    host_spies = """
+static void host_taps(void) {}
+static void host_stick_read(int32_t stick[4]) { (void)stick; }
+static void host_drag_read(int32_t stick[4]) { (void)stick; }
+static void player_used(void) {}
+"""
+    actual = "\n".join((cheat_state, cheat_spies, host_spies, block(hid, "static int key("), block(hid, "static int kmap_down("),
         block(hid, "static int game_in_front("), hid[start:end], block(hid, "static void stick_max("),
         block(hid, "static int pads_in_background("),
         # (the bound keys' helpers read_input calls: a mouse button counts only while the mouse is captured)

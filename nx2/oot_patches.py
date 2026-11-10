@@ -141,6 +141,41 @@ def patch_mouse_camera(source):
     source = source[:at] + "    hos_mouse_camera(c->x[0]);   /* (nx2/oot_patches.py: native mouse look) */\n" + source[at:]
     return source.replace('#include "a64.h"\n', '#include "a64.h"\nextern void hos_mouse_camera(uint64_t camera);\n', 1)
 
+
+MENU_FOCUS_HEAD = "void f_802ed660(Ctx *__restrict A64_NOESC c) {\n"
+
+
+def patch_menu_focus(source):
+    """f_802ed660, a menu screen's handler of a pane getting the focus (host/oot_menu.c), calls
+    hos_oot_menu_focus first, with the screen, the pane and its caller's return address"""
+    start = source.find(MENU_FOCUS_HEAD)
+    if start < 0:
+        return None
+    if "hos_oot_menu_focus(c," in source:   # (made before: a lift patched again)
+        return source
+    at = start + len(MENU_FOCUS_HEAD)
+    hook = "    hos_oot_menu_focus(c, c->x[0], c->x[1], c->x[30]);   /* (nx2/oot_patches.py: the menus' focus) */\n"
+    return (source[:at] + hook + source[at:]).replace(
+        '#include "a64.h"\n', '#include "a64.h"\nextern void hos_oot_menu_focus(Ctx *c, uint64_t screen, uint64_t pane, uint64_t lr);\n', 1)
+
+
+MENU_TICK_HEAD = "void f_802f1380(Ctx *__restrict A64_NOESC c) {\n"
+
+
+def patch_menu_tick(source):
+    """f_802f1380, a menu screen's update (each frame, before the screen's UI controller: +56, its vtable's
+    +16), calls hos_oot_menu_tick first with the screen: the game's menus' mouse (host/oot_menu.c)"""
+    start = source.find(MENU_TICK_HEAD)
+    if start < 0:
+        return None
+    if "hos_oot_menu_tick(c," in source:   # (made before: a lift patched again)
+        return source
+    at = start + len(MENU_TICK_HEAD)
+    hook = "    hos_oot_menu_tick(c, c->x[0]);   /* (nx2/oot_patches.py: the menus' mouse) */\n"
+    return (source[:at] + hook + source[at:]).replace(
+        '#include "a64.h"\n', '#include "a64.h"\nextern void hos_oot_menu_tick(Ctx *c, uint64_t screen);\n', 1)
+
+
 TEXT_HEAD = "void f_80b1e140(Ctx *__restrict A64_NOESC c) {"
 # (the letters' block: past the early returns, the auto-advance timer and the hidden / no-text checks; reached once a call)
 TEXT_OLD = ("L_80b1e1b4:;\n"
@@ -161,6 +196,55 @@ def patch_dynres(s):
     scale = s.index(SCALE_OLD, at)
     s = s[:scale] + SCALE_NEW + s[scale + len(SCALE_OLD):]
     return s.replace('#include "a64.h"\n', '#include "a64.h"\n' + DECL, 1)
+
+
+# The frame's real time in place of the nominal rate, for a Frame rate cap above 60 (host/nn_vi.c hos_frame_seconds_bits; 0, as
+# at a cap of 60: the game's own divide, nothing changes). The engine has two places where its integer nominal rate (+0x2c8 of
+# the graphics module) becomes a time step, both a float divide "base / nominal":
+# - f_80706be0: the frame's step, base 60.0 (30.0 in the half-rate mode), added to the game clock (the double at
+#   [x19+0xd58], in 1/60 s) and handed on as the frame's seconds;
+# - f_83b6ea90: the global step (60.0 / nominal, a float in .data) the rest of the engine reads.
+# The engine's own rate is 60 / <whole display intervals>, never above 60, and its controller puts 60 back over a higher value
+# written from outside before either divide runs: above 60 fps every frame still stepped 1/60 s and the game ran fps / 60 times
+# too fast. With the host's measured frame time the step is base * seconds, whatever the rate. hos_step_probe: f_80706be0's
+# x19, which tells the host the hook is in this build and gives it the game clock for its log (HOS_FPS_LOG=1).
+STEP_SITES = (("void f_80706be0(Ctx *__restrict A64_NOESC c) {\n", 8, "\n    hos_step_probe = c->x[19];"),
+              ("void f_83b6ea90(Ctx *__restrict A64_NOESC c) {\n", 0, ""))
+STEP_OLD = "    _v=a64_fpx_div32_div32(c,_a,_b);\n    a64_vset64(c->vreg[%d],_v);}"
+STEP_HOOK = ("    _v=a64_fpx_div32_div32(c,_a,_b);\n"
+             "    { const uint32_t _hs = hos_frame_seconds_bits; if (_hs) { float _base, _secs; uint32_t _w; memcpy(&_base,&_a,4); "
+             "memcpy(&_secs,&_hs,4); _base *= _secs; memcpy(&_w,&_base,4); _v = _w; } }   /* (base * the frame's seconds: nx2/oot_patches.py) */\n"
+             "    a64_vset64(c->vreg[%d],_v);}")
+STEP_MARK = "hos_frame_seconds_bits; if (_hs)"   # (once per divide with the hook)
+STEP_DECL = "extern volatile uint32_t hos_frame_seconds_bits;\nextern volatile uint64_t hos_step_probe;\n"
+
+
+def patch_frame_seconds(s):
+    """The host's frame time at the step divides of f_80706be0 and f_83b6ea90: (s, the sites patched here). A site whose
+    function is not in the file, is patched already, or whose code differs (another game version) is left as it is."""
+    done = 0
+    for head_text, reg, extra in STEP_SITES:
+        head = s.find(head_text)
+        if head < 0:
+            continue
+        end = s.find("\nvoid f_", head + len(head_text))
+        body = s[head:end if end >= 0 else len(s)]
+        old, new = STEP_OLD % reg, STEP_HOOK % reg + extra
+        if new in body or body.count(old) != 1 or body.count("a64_fpx_div32_div32") != 1:
+            continue
+        at = head + body.index(old)
+        s = s[:at] + new + s[at + len(old):]
+        done += 1
+    if done and STEP_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + STEP_DECL, 1)
+    return s, done
+
+
+def unpatch_frame_seconds(s):
+    """s without the hook, as the lift wrote it: for a lift where only one of the two divides was found (apply)"""
+    for _, reg, extra in STEP_SITES:
+        s = s.replace(STEP_HOOK % reg + extra, STEP_OLD % reg)
+    return s if STEP_MARK in s else s.replace(STEP_DECL, "", 1)   # (a hook of another shape stays, with its declarations)
 
 
 def patch_text_speed(s):
@@ -191,13 +275,16 @@ def apply(gen, *, protect_hearts=False, required=False):
     import oot_native_resolution   # (HOS_SCENE_NATIVE=1: the scene's base scale 1.0; off by default since #849's output resolution)
     oot_native_resolution.apply(gen)
     done = {"dynamic resolution branch": 0, "text speed block": 0, "fixed path's scale": 0}
-    if protect_hearts:
+    if protect_hearts:   # (the supported build's: these places are its functions)
+        done["menu focus hook"] = 0
+        done["menu tick hook"] = 0
         done["player heart protection"] = 0
         done["player flight"] = 0
         done["player flight rotation"] = 0
         done["free camera"] = 0
         done["mouse camera"] = 0
-    for path in sorted(glob.glob(os.path.join(gen, "code_*.c"))):
+    step_sites, step_files = 0, []   # (the divides with the hook, and the files that have it)
+    for path in sorted(glob.glob(os.path.join(glob.escape(gen), "code_*.c"))):
         with open(path, encoding="utf-8", newline="") as f:
             s = f.read()
         out = s
@@ -211,6 +298,16 @@ def apply(gen, *, protect_hearts=False, required=False):
             out = t
             done["text speed block"] += 1
             print("oot_patches: text speed scale in", os.path.basename(path))
+        focus = patch_menu_focus(out) if protect_hearts else None
+        if focus is not None:
+            out = focus
+            done["menu focus hook"] += 1
+            print("oot_patches: the menus' focus hook in", os.path.basename(path))
+        tick = patch_menu_tick(out) if protect_hearts else None
+        if tick is not None:
+            out = tick
+            done["menu tick hook"] += 1
+            print("oot_patches: the menus' update hook in", os.path.basename(path))
         out, n = fixed_scale(out)
         if n:
             done["fixed path's scale"] += 1
@@ -240,11 +337,26 @@ def apply(gen, *, protect_hearts=False, required=False):
             out = view
             done["free camera"] += 1
             print("oot_patches: free camera in", os.path.basename(path))
+        out, sites = patch_frame_seconds(out)
+        if STEP_MARK in out:   # (made now, or by an earlier run over this file)
+            step_sites += out.count(STEP_MARK)
+            step_files.append(path)
+        if sites:
+            print("oot_patches: the frame's time at %d step divide(s) in %s" % (sites, os.path.basename(path)))
         if out != s:
             whole_write.write_whole(path, out, newline="")
     for what, n in done.items():
         if n != 1:
             print("oot_patches: WARNING: the %s was found %d times" % (what, n))
+    if step_sites != len(STEP_SITES):
+        # (both or neither: with one divide timed and the other stepping 1/60 s the two clocks of the game would run apart. Without
+        # the hook the host keeps the rate up to the cap, as before: host/nn_vi.c, hos_step_probe)
+        for path in step_files:
+            with open(path, encoding="utf-8", newline="") as f:
+                s = f.read()
+            whole_write.write_whole(path, unpatch_frame_seconds(s), newline="")
+        print("oot_patches: WARNING: the frame's time was found at %d of %d step divides, none patched (a Frame rate cap above 60 "
+              "keeps the game's own step)" % (step_sites, len(STEP_SITES)))
     apply_output_size(gen, required=required)
 
 
@@ -313,7 +425,7 @@ def apply_output_size(gen, required=False):
     one the Insert menu's Output resolution is ignored, or a 4K output runs out of the render targets' pool. Elsewhere (another
     build, part of a lift, by hand) a warning"""
     found = [0] * len(OUT_EDITS)
-    for path in sorted(glob.glob(os.path.join(gen, "code_*.c"))):
+    for path in sorted(glob.glob(os.path.join(glob.escape(gen), "code_*.c"))):
         with open(path, encoding="utf-8", newline="") as f:
             s = f.read()
         hit = False

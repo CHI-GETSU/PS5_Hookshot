@@ -184,6 +184,11 @@
                       Content="NVIDIA DLSS (downloads NVIDIA's SDK under NVIDIA's license)"/>
             <TextBlock Style="{StaticResource Note}" FontSize="12" Margin="26,4,0,0" TextWrapping="Wrap"
                        Text="For NVIDIA RTX graphics cards. NVIDIA's files stay on this PC: never share a game folder built with them."/>
+            <!-- AMD FSR 4: off unless ticked. Nothing is downloaded: AMD's DLLs are put beside the game by hand (the readme) -->
+            <CheckBox x:Name="FsrTick" Style="{StaticResource Tick}" IsChecked="False" Margin="0,10,0,0"
+                      Content="AMD FSR 4 (AMD's files are not included: see the readme)"/>
+            <TextBlock Style="{StaticResource Note}" FontSize="12" Margin="26,4,0,0" TextWrapping="Wrap"
+                       Text="For AMD Radeon graphics cards. It is chosen in the game's Insert menu, as the Upscaler."/>
           </StackPanel>
 
           </Grid>

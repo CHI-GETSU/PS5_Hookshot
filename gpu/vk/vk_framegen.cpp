@@ -23,6 +23,7 @@
 #include "vk_fsr3_inputs.h"   // (AMD FSR 3.1 frame interpolation's depth and motion)
 #include "vk_fsr3fi.h"
 #include "vk_menu.h"
+#include "vk_present_rect.h"
 #ifdef HOOKSHOT_MIHAWKGEN
 #include "framegen.h"   // (PS5_MihawkGen's generator, framegen/include: ps5/build.py)
 #endif
@@ -571,13 +572,13 @@ bool framegen_on() {
 VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh) {
     if (!opts.upscale && !opts.sharpness) return VK_NULL_HANDLE;
     if (!src || !image || !sw || !sh || !dw || !dh) return VK_NULL_HANDLE;
-    if (crop && crop[2] > 0 && crop[3] > 0 &&
-        (crop[0] < 0 || crop[1] < 0 || (uint32_t)crop[0] >= sw || (uint32_t)crop[1] >= sh)) return VK_NULL_HANDLE;
+    const PresentSourceRect source = present_source_rect(sw, sh, crop);
+    if (!source.w || !source.h) return VK_NULL_HANDLE;
     if (!init_scale()) return VK_NULL_HANDLE;
     // (the game draws into part of its window textures, 2048 x 1152 of 2560 x 1440 here: the filter was given the whole texture, and the
     // picture came out in the top left corner of the window with black around it. The crop first, then the filter)
-    if (crop && crop[2] > 0 && crop[3] > 0 && (crop[0] || crop[1] || (uint32_t)crop[2] < sw || (uint32_t)crop[3] < sh)) {
-        const uint32_t cw = std::min((uint32_t)crop[2], sw - (uint32_t)crop[0]), ch = std::min((uint32_t)crop[3], sh - (uint32_t)crop[1]);
+    if (source.x || source.y || source.w != sw || source.h != sh) {
+        const uint32_t cw = source.w, ch = source.h;
         if (scale.cropped_w != cw || scale.cropped_h != ch) {
             {
                 std::lock_guard qk(dev.present_mu);
@@ -594,8 +595,8 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
         }
         VkImageBlit b{};
         b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        b.srcOffsets[0] = {crop[0], crop[1], 0};
-        b.srcOffsets[1] = {crop[0] + (int)cw, crop[1] + (int)ch, 1};
+        b.srcOffsets[0] = {(int)source.x, (int)source.y, 0};
+        b.srcOffsets[1] = {(int)(source.x + cw), (int)(source.y + ch), 1};
         b.dstOffsets[1] = {(int)cw, (int)ch, 1};
         vkCmdBlitImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, scale.cropped.image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
         full_barrier(cmd);
@@ -635,6 +636,8 @@ VkImageView framegen_scaled_view() { return scale.scaled.view; }
 /// swapchain's image as the SDR picture is (shaders/hdr_encode.comp); null when it cannot be made (then the SDR picture)
 VkImage framegen_hdr(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh) {
     if (!src || !sw || !sh || !dw || !dh) return VK_NULL_HANDLE;
+    const PresentSourceRect source = present_source_rect(sw, sh, crop);
+    if (!source.w || !source.h) return VK_NULL_HANDLE;
     if (!hdr.init) {
         hdr.init = hdr.failed = true;
         const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -661,11 +664,8 @@ VkImage framegen_hdr(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         hdr.w = dw, hdr.h = dh;
         to_general(cmd, hdr.out.image);
     }
-    float x0 = 0, y0 = 0, x1 = 1, y1 = 1;
-    if (crop && crop[2] > 0 && crop[3] > 0) {
-        x0 = crop[0] / (float)sw, y0 = crop[1] / (float)sh;
-        x1 = std::min(1.0f, (crop[0] + crop[2]) / (float)sw), y1 = std::min(1.0f, (crop[1] + crop[3]) / (float)sh);
-    }
+    const float x0 = source.x / (float)sw, y0 = source.y / (float)sh;
+    const float x1 = (source.x + source.w) / (float)sw, y1 = (source.y + source.h) / (float)sh;
     const struct { float uv[4]; float white, peak, knee, pad; } pc{{x0, y0, x1, y1}, (float)std::clamp(opts.hdr_white, 80, 500),
                                                                    (float)std::clamp(opts.hdr_peak, 400, 10000), 0.6f, 0.0f};
     pass(cmd, hdr.pipe, {{src, scale.linear}, {hdr.out.view, VK_NULL_HANDLE}}, dw, dh, &pc, sizeof pc);
@@ -718,9 +718,8 @@ int fsr3fi_frame(VkCommandBuffer cmd, OutSet& set, int cur, uint32_t uw, uint32_
 }
 
 bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4]) {
-    int x0 = 0, y0 = 0, w = (int)sw, h = (int)sh;
-    if (crop && crop[2] > 0 && crop[3] > 0) x0 = crop[0], y0 = crop[1], w = crop[2], h = crop[3];
-    w = std::min(w, (int)sw - x0), h = std::min(h, (int)sh - y0);
+    const PresentSourceRect source = present_source_rect(sw, sh, crop);
+    const int x0 = (int)source.x, y0 = (int)source.y, w = (int)source.w, h = (int)source.h;
     if (!src || w <= 0 || h <= 0 || !init() || !ensure_size(cmd, (uint32_t)w, (uint32_t)h)) return false;
     if (!fg.thread_started) {
         fg.thread_started = true;

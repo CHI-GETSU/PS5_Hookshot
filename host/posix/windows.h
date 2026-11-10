@@ -1,7 +1,7 @@
 /* (linux) The part of the Win32 API Hookshot's runtime and Vulkan back end use, on POSIX: host/posix is on the include
    path of Linux builds only (nx2/build.py), so `#include <windows.h>` finds this file and the Windows code paths stay
-   as they are. Implemented in win32_posix.c (threads, events, fibers, files, memory, modules, exceptions, waveOut),
-   gdi_posix.c (the bit of GDI the Insert menu draws its text with) and display_sdl.c (the window, keyboard, mouse).
+   as they are. Implemented in win32_posix.c (threads, events, fibers, files, memory, modules, exceptions, waveOut) and
+   display_sdl.c (the window, keyboard, mouse).
 
    Not a general emulation: what is here is what the code calls, with the behaviour it relies on. Handles are
    pointers to objects of this file's own (threads, events, timers, files, find searches); the guest window is one
@@ -583,56 +583,6 @@ int MessageBoxA(HWND w, LPCSTR text, LPCSTR caption, UINT type);
 #ifndef MB_ICONWARNING
 #define MB_ICONWARNING 0x00000030L
 #endif
-
-/* ---- GDI: the Insert menu's text into a 32-bit bitmap (gdi_posix.c) ---- */
-#define BI_RGB 0
-#define DIB_RGB_COLORS 0
-#define TRANSPARENT 1
-#define OPAQUE 2
-#define TA_LEFT 0
-#define TA_RIGHT 2
-#define TA_CENTER 6
-#define TA_TOP 0
-#define TA_BOTTOM 8
-#define TA_BASELINE 24
-#define FW_NORMAL 400
-#define FW_MEDIUM 500
-#define FW_SEMIBOLD 600
-#define FW_BOLD 700
-#define DEFAULT_CHARSET 1
-#define OUT_DEFAULT_PRECIS 0
-#define CLIP_DEFAULT_PRECIS 0
-#define DEFAULT_QUALITY 0
-#define NONANTIALIASED_QUALITY 3
-#define ANTIALIASED_QUALITY 4
-#define CLEARTYPE_QUALITY 5
-#define DEFAULT_PITCH 0
-typedef struct {
-    DWORD biSize;
-    LONG biWidth, biHeight;
-    WORD biPlanes, biBitCount;
-    DWORD biCompression, biSizeImage;
-    LONG biXPelsPerMeter, biYPelsPerMeter;
-    DWORD biClrUsed, biClrImportant;
-} BITMAPINFOHEADER;
-typedef struct { BYTE rgbBlue, rgbGreen, rgbRed, rgbReserved; } RGBQUAD;
-typedef struct { BITMAPINFOHEADER bmiHeader; RGBQUAD bmiColors[1]; } BITMAPINFO;
-HDC CreateCompatibleDC(HDC dc);
-BOOL DeleteDC(HDC dc);
-HBITMAP CreateDIBSection(HDC dc, const BITMAPINFO *bi, UINT usage, void **bits, HANDLE section, DWORD offset);
-HGDIOBJ SelectObject(HDC dc, HGDIOBJ obj);
-BOOL DeleteObject(HGDIOBJ obj);
-BOOL GdiFlush(void);
-HFONT CreateFontA(int height, int width, int escapement, int orientation, int weight, DWORD italic, DWORD underline,
-                  DWORD strikeout, DWORD charset, DWORD out_precision, DWORD clip_precision, DWORD quality, DWORD pitch,
-                  LPCSTR face);
-HBRUSH CreateSolidBrush(COLORREF c);
-int FillRect(HDC dc, const RECT *r, HBRUSH b);
-int SetBkMode(HDC dc, int mode);
-COLORREF SetTextColor(HDC dc, COLORREF c);
-UINT SetTextAlign(HDC dc, UINT align);
-BOOL TextOutA(HDC dc, int x, int y, LPCSTR s, int n);
-BOOL GetTextExtentPoint32A(HDC dc, LPCSTR s, int n, SIZE *size);
 
 #ifdef __cplusplus
 }

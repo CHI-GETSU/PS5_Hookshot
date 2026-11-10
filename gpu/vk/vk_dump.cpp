@@ -80,6 +80,19 @@ void barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayo
     vkCmdPipelineBarrier2(cmd, &d);
 }
 
+// Completion alone does not make the staging copy available to host reads.
+void host_read_barrier(VkCommandBuffer cmd) {
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+    b.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1;
+    d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
+}
+
 uint8_t unit(float v) {
     return (uint8_t)std::clamp((int)std::lround(v * 255.0f), 0, 255);
 }
@@ -337,10 +350,11 @@ void dump_image(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t laye
                            it.buffer_alloc, &it.map))
             return;
         full_barrier(cmd);
-        const VkBufferImageCopy c{0, 0, 0, {raw_9e5 ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, level,
+        const VkBufferImageCopy c{0, 0, 0, {(VkImageAspectFlags)(raw_9e5 ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT), level,
                                             std::min(layer, tex->layers - 1), 1}, {0, 0, 0},
                                   {it.w, it.h, 1}};
         vkCmdCopyImageToBuffer(cmd, tex->image, VK_IMAGE_LAYOUT_GENERAL, it.buffer, 1, &c);
+        host_read_barrier(cmd);
         full_barrier(cmd);
         items.push_back(std::move(it));
         return;
@@ -389,6 +403,7 @@ void dump_image(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t laye
     barrier(cmd, it.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     const VkBufferImageCopy c{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {it.w, it.h, 1}};
     vkCmdCopyImageToBuffer(cmd, it.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, it.buffer, 1, &c);
+    host_read_barrier(cmd);
     full_barrier(cmd);
     items.push_back(std::move(it));
 }
@@ -422,6 +437,7 @@ void dump_buffer(VkCommandBuffer cmd, VkBuffer src, VkDeviceSize off, VkDeviceSi
     vkCmdPipelineBarrier2(cmd, &d);
     const VkBufferCopy c{off, 0, n};
     vkCmdCopyBuffer(cmd, src, it.buffer, 1, &c);
+    host_read_barrier(cmd);
     vkCmdPipelineBarrier2(cmd, &d);
     buf_items.push_back(std::move(it));
 }
@@ -432,12 +448,15 @@ bool dump_pending() {
 
 void dump_write() {
     for (Item& it : items) {
+        // Before write_item converts depth and changes its dimensions/map.
+        invalidate_mapped(it.buffer_alloc, (uint64_t)it.w * it.h * (it.depth_bytes ? it.depth_bytes : 16));
         write_item(it);
         destroy_buffer(it.buffer, it.buffer_alloc);
         if (it.image) destroy_image(it.image, it.image_alloc);
     }
     items.clear();
     for (BufItem& it : buf_items) {
+        invalidate_mapped(it.alloc, it.n);
         const uint32_t* w = (const uint32_t*)it.map;
         const size_t nw = it.n / 4;
         size_t nz = 0;

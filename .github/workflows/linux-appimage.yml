@@ -29,24 +29,25 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          apt-get update
-          # (libstdc++ 13, from the toolchain PPA: the Vulkan back end's C++20 needs <format>; linked in statically)
-          apt-get install -y --no-install-recommends software-properties-common gpg-agent
-          add-apt-repository -y ppa:ubuntu-toolchain-r/test
-          apt-get install -y --no-install-recommends g++-13 libstdc++-13-dev
-          # (three tries, each after a fresh apt-get update: a 404 when the mirror published a security update between the
-          # update and the download failed a run, 2026-11-10)
+          # Retry the entire bootstrap: even the first index refresh or the toolchain setup can fail while a mirror syncs.
+          # Every attempt refreshes the signed indexes; no stale-index or authentication checks are bypassed.
           for try in 1 2 3; do
-            if apt-get install -y --no-install-recommends git ca-certificates curl xz-utils zstd file unzip python3 \
+            # (libstdc++ 13, from the toolchain PPA: C++20 <format>; linked in statically)
+            if apt-get update &&
+              apt-get install -y --no-install-recommends software-properties-common gpg-agent &&
+              add-apt-repository -y ppa:ubuntu-toolchain-r/test &&
+              apt-get install -y --no-install-recommends g++-13 libstdc++-13-dev &&
+              apt-get install -y --no-install-recommends git ca-certificates curl xz-utils zstd file unzip python3 \
               build-essential gcc-12 g++-12 libstdc++-12-dev nasm meson ninja-build cmake pkg-config \
               libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxfixes-dev libxinerama-dev \
               libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev libegl-dev libgles-dev libdrm-dev libgbm-dev \
               libpulse-dev libasound2-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev libxft-dev libfontconfig1-dev zlib1g-dev; then
               break
+            else
+              package_status=$?
             fi
-            if [ "$try" = 3 ]; then exit 1; fi
+            if [ "$try" = 3 ]; then exit "$package_status"; fi
             sleep 20
-            apt-get update
           done
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -96,11 +97,33 @@ jobs:
       - name: AppImage
         run: scripts/linux/appimage.sh
 
+      # (AMD FSR 4's Linux side, a build option the AppImage leaves off (gpu/vk/vk_fsr4.cpp: dlopen, the older backend
+      # description, the unit exposure; the descriptor buffers in vk_main.cpp): built once more in a copy of the back end's
+      # work folder, where only vk_fsr4.cpp compiles again. The AppImage above is not changed)
+      - name: hookshot_vk.so with AMD FSR 4 (build check)
+        shell: bash   # (this container's default is sh, which has no PIPESTATUS)
+        run: |
+          cp -r build-linux/vk-work "$RUNNER_TEMP/vk-fsr"
+          rm -f "$RUNNER_TEMP/vk-fsr/sa/build/hookshot_vk.so"   # (the AppImage's own, without FSR: the test below is this build's)
+          D="$PWD/build-linux/deps"
+          OOT_WORK="$RUNNER_TEMP/vk-fsr" EMSDK="$D/emsdk" RX_CPM="$D/cpm" RX_MARCH=x86-64-v3 RX_VK_ONLY=1 RX_RELEASE=1 HOOKSHOT_FSR=1 \
+            "$D/python/bin/python3" -I nx2/build.py --standalone --jobs "$(nproc)" |
+            tee "$RUNNER_TEMP/vk-fsr.log"
+          test "${PIPESTATUS[0]}" -eq 0
+          grep -q "with AMD FSR 4" "$RUNNER_TEMP/vk-fsr.log"
+          test -f "$RUNNER_TEMP/vk-fsr/sa/build/hookshot_vk.so"
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: Hookshot-linux-x86_64
           path: build-linux/*.AppImage
           if-no-files-found: error
+
+      # (a player's build started from the AppImage itself, with no game, up to where the lifted game is needed: a file the
+      # AppImage does not carry fails here, not in every player's build. 2026-11-10: third_party/fonts, #1567. After the upload,
+      # so a failing image can be looked at; a tag's release needs this job to pass)
+      - name: A player's build from the AppImage
+        run: scripts/linux/check_player_build.sh
 
       # (a tag's update parts, for the release job: scripts/linux/make_parts.py. Not on other runs: about 240 MB)
       - if: startsWith(github.ref, 'refs/tags/')

@@ -1,4 +1,4 @@
-"""The start-up screen's logo (gpu/vk/vk_startup_paint.h) from assets/hookshot.png: a C header with its pixels as straight
+"""The start-up screen's logo (gpu/vk/vk_imgui.cpp, drawn by vk_menu.cpp) from assets/hookshot.png: a C header with its pixels as straight
 RGBA bytes, written by nx2/build.py into the build's own folder (no second copy of the picture in the repository).
 
     python nx2/logo_rgba.py [picture.png] [out.h]

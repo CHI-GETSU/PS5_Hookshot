@@ -82,7 +82,7 @@ together.
 - [ ] A scene's first frames: 0.3-0.6 s, 3 s where its shaders are met for the first time
 - [ ] Out of memory after a while under load (0.4-1.1 GB of 13.2 free in Kokiri Forest)
 
-Local `main` is upstream's `main` of 2026-11-10 with PR #1438 (AMD resolve keys, image fallback past VMA's budget) and RufflezAU's
+Local `main` is upstream's `main` of 2026-11-10 (2877284, past v2.0.14's line) with PR #1438 (AMD resolve keys, image fallback past VMA's budget) and RufflezAU's
 Steam Deck texture eviction by age in milliseconds (`RX_VK_EVICT_MIN_MS`, 1000; read once a present here, not at each touch).
 
 ## What a test run must not do
@@ -92,6 +92,10 @@ The console's file system holds every `open` in the title's folder for ~1.8 s wh
 a run that reads `HOS_INPUT_LIVE` (an `fopen` 30 times a second) or writes `RX_VK_SHOTS` there stands still each time, and so
 did every run made with `to-kokiri.sh` and `flash-run.sh`. `play-run.sh` has neither: timed presses (`HOS_INPUT_SCRIPT`) and
 the log. Its slowest frame in steady play is 42-44 ms.
+
+A run's switches are not in the player's `hookshot_env.txt`, which takes neither paths nor an input script: `ps5/tools/run.py`
+writes them to `hookshot_test_env.txt` in the title folder, read in its place and without its limits (the console starts a title
+with no environment to set `HOS_ENV_FILE` in), and removes the file when the run ends.
 
 ## Finding a fault against the PC
 

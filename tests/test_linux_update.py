@@ -21,6 +21,23 @@ import linux_update  # noqa: E402
 import make_parts  # noqa: E402
 
 
+def sysroot_fixture(root):
+    source = root / "usr" / "lib" / "hookshot" / "sysroot"
+    lib = source / "usr" / "lib" / "x86_64-linux-gnu"
+    lib.mkdir(parents=True)
+    (source / "lib").symlink_to("usr/lib")
+    (lib / "libmvec.so").symlink_to("/lib/x86_64-linux-gnu/libmvec.so.1")
+    (lib / "libmvec.so.1").write_bytes(b"contents")
+    return source
+
+
+def zip_link(zipped, name, target):
+    info = zipfile.ZipInfo(name)
+    info.create_system = 3
+    info.external_attr = (stat.S_IFLNK | 0o777) << 16
+    zipped.writestr(info, target)
+
+
 def appdir(path):
     """A tiny AppDir: one file in each part, plus the launcher script an install copies to AppRun."""
     tools = path / "usr" / "share" / "hookshot"
@@ -41,6 +58,156 @@ def appdir(path):
 
 
 class UpdateTests(unittest.TestCase):
+    def test_relative_links_and_final_list_stay_inside_the_staging_tree(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(prefix="hookshot-link-bounds-") as tmp:
+            root = Path(tmp).resolve()
+            cases = (
+                ("download-manifest-escape", False, linux_update.LIST_NAME, "../canary", False),
+                ("reuse-manifest-escape", True, linux_update.LIST_NAME, "../canary", False),
+                ("download-unused-escape", False, "alias", "../canary", False),
+                ("reuse-unused-escape", True, "alias", "../canary", False),
+                ("reuse-listed-escape", True, "alias", "../canary", False),
+                ("reuse-absolute-escape", True, "alias", None, False),
+                ("part-supplied-list", False, linux_update.LIST_NAME, None, False),
+                ("internal-list-alias", False, linux_update.LIST_NAME, "inside", False),
+                ("download-cross-part", False, "alias", "usr/lib/target", True),
+                ("reuse-cross-part", True, "alias", "usr/lib/target", True),
+                ("download-forward-link", False, "alias", "inside", True),
+                ("reuse-listed-internal", True, "alias", "inside", True),
+            )
+            for label, reuse, name, link_to, succeeds in cases:
+                with self.subTest(case=label):
+                    case = root / label
+                    home = case / "home"
+                    versions = home / "hookshot" / "builder" / "versions"
+                    previous = versions / "v1"
+                    previous.mkdir(parents=True)
+                    (previous / "kept").write_bytes(b"previous version")
+                    current = versions.parent / "current"
+                    current.write_text("v1\n", encoding="utf-8")
+                    canary = versions / "canary"
+                    canary.write_bytes(b"authored sibling canary")
+                    partial = versions / "v2.part"
+                    self.assertEqual(partial.parent, canary.parent)
+                    self.assertIn(root, canary.resolve().parents)
+                    before = canary.read_bytes()
+                    files = {"usr/share/hookshot/builder/linux/AppRun": b"authored placeholder, never executed\n",
+                             "inside": b"inside"}
+                    if "listed" in label:
+                        del files["usr/share/hookshot/builder/linux/AppRun"]
+                    if link_to is None and reuse:
+                        link_to = str(canary)
+                    if link_to is None:
+                        files[name] = b"part-supplied list"
+                    archive = io.BytesIO()
+                    with zipfile.ZipFile(archive, "w") as zipped:
+                        if link_to is not None:
+                            zip_link(zipped, name, link_to)  # before its target, when it is a valid forward link
+                        for filename, data in files.items():
+                            zipped.writestr(filename, data)
+                    data = archive.getvalue()
+                    part = linux_update.Part(linux_update._sha256(data), len(data), ".", "authored-part", None)
+                    if "listed" in label:
+                        part.files = list(files) + [name]
+                    parts, payloads = [part], {part.url: data}
+                    if "listed" in label:
+                        archive = io.BytesIO()
+                        with zipfile.ZipFile(archive, "w") as zipped:
+                            zipped.writestr("usr/share/hookshot/builder/linux/AppRun", b"authored placeholder, never executed\n")
+                        data = archive.getvalue()
+                        tools = linux_update.Part(linux_update._sha256(data), len(data), ".", "authored-tools", None)
+                        parts.append(tools)
+                        payloads[tools.url] = data
+                    if "cross-part" in label:
+                        archive = io.BytesIO()
+                        with zipfile.ZipFile(archive, "w") as zipped:
+                            zipped.writestr("target", b"cross-part")
+                        data = archive.getvalue()
+                        other = linux_update.Part(linux_update._sha256(data), len(data), "usr/lib", "authored-library", None)
+                        parts.append(other)
+                        payloads[other.url] = data
+                    source_root, source = None, None
+                    if reuse:
+                        source_root = case / "source"
+                        source_root.mkdir()
+                        for filename, content in files.items():
+                            path = source_root / filename
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            path.write_bytes(content)
+                        (source_root / name).symlink_to(link_to)
+                        source = linux_update.Manifest("v1", [part])
+                    error = None
+                    with mock.patch.dict(os.environ, {"HOOKSHOT_BUILDER_HOME": str(home)}):
+                        try:
+                            apprun = linux_update.install(linux_update.Manifest("v2", parts),
+                                                         str(source_root) if reuse else None, source,
+                                                         get=lambda url: payloads[url])
+                        except Exception as caught:
+                            error = caught
+                    # Check even when install raised: an error after truncation is not safe rejection.
+                    self.assertEqual(canary.read_bytes(), before, "the sibling canary was overwritten")
+                    if succeeds:
+                        self.assertIsNone(error)
+                        installed = versions / "v2"
+                        self.assertEqual(apprun, str(installed / "AppRun"))
+                        self.assertEqual(current.read_text(encoding="utf-8"), "v2\n")
+                        self.assertEqual((installed / "alias").read_bytes(),
+                                         b"cross-part" if "cross-part" in label else b"inside")
+                        self.assertTrue((installed / "alias").is_symlink())
+                    else:
+                        self.assertIsInstance(error, (ValueError, FileExistsError))
+                        self.assertEqual(current.read_text(encoding="utf-8"), "v1\n")
+                        self.assertEqual((previous / "kept").read_bytes(), b"previous version")
+                        self.assertFalse(partial.exists())
+                    print("PASS link bounds:", label)
+            with self.subTest(case="relative-target-through-an-existing-alias"):
+                case = root / "resolved-escape"
+                dest = case / "stage"
+                dest.mkdir(parents=True)
+                canary = case / "canary"
+                canary.write_bytes(b"resolved sibling canary")
+                before = canary.read_bytes()
+                (dest / "redirect").symlink_to("..", target_is_directory=True)
+                archive = io.BytesIO()
+                with zipfile.ZipFile(archive, "w") as zipped:
+                    zip_link(zipped, "alias", "redirect/canary")
+                error = None
+                try:
+                    linux_update._unpack(archive.getvalue(), str(dest), None)
+                except Exception as caught:
+                    error = caught
+                self.assertEqual(canary.read_bytes(), before)
+                self.assertIsInstance(error, ValueError)
+                self.assertFalse((dest / "alias").is_symlink())
+                print("PASS link bounds: relative-target-through-an-existing-alias")
+            with self.subTest(case="published-parts-do-not-own-the-list"):
+                source, out = root / "publisher", root / "parts"
+                appdir(source)
+                with mock.patch.object(sys, "argv", ["make_parts.py", str(source), "v2", str(out)]):
+                    make_parts.main()
+                manifest = linux_update.parse_list((out / linux_update.LIST_NAME).read_text(encoding="utf-8"))
+                payloads = {}
+                for part in manifest.parts:
+                    archive = out / part.url.rsplit("/", 1)[-1]
+                    with zipfile.ZipFile(archive) as zipped:
+                        self.assertNotIn(linux_update.LIST_NAME, zipped.namelist())
+                    payloads[part.url] = archive.read_bytes()
+                home = root / "publisher-home"
+                versions = home / "hookshot" / "builder" / "versions"
+                versions.mkdir(parents=True)
+                canary = versions / "canary"
+                canary.write_bytes(b"publisher sibling canary")
+                before = canary.read_bytes()
+                with mock.patch.dict(os.environ, {"HOOKSHOT_BUILDER_HOME": str(home)}):
+                    apprun = linux_update.install(manifest, None, None, get=lambda url: payloads[url])
+                self.assertEqual(canary.read_bytes(), before)
+                self.assertTrue(Path(apprun).is_file())
+                installed = linux_update.read_manifest(str(versions / "v2"))
+                self.assertEqual(installed.tag, "v2")
+                self.assertEqual(len(installed.parts), len(make_parts.PARTS))
+                print("PASS link bounds: published-parts-do-not-own-the-list")
+
     def test_install_rejects_a_staging_link_before_cleanup_or_placing_parts(self):
         from unittest import mock
         for exists in (False, True):
@@ -159,6 +326,80 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(linux_update._read_at_most(io.BytesIO(b"x" * 10), 10), b"x" * 10)
         with self.assertRaises(RuntimeError):
             linux_update._read_at_most(io.BytesIO(b"x" * 11), 10)
+
+    def test_a_download_is_a_get(self):
+        # (Request's second argument is the POST body: v2.0.12's str there failed every download before it connected)
+        from unittest import mock
+        seen = []
+
+        class Answer(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def urlopen(req, timeout=None):
+            seen.append(req)
+            return Answer(b"list")
+        with mock.patch("urllib.request.urlopen", urlopen):
+            self.assertEqual(linux_update._request("https://example.invalid/list.txt", 5), b"list")
+        self.assertEqual(seen[0].get_method(), "GET")
+        self.assertIsNone(seen[0].data)
+
+    def test_a_link_chain_cannot_leave_the_staging_tree(self):
+        # x/../.. is inside the folder as written, but the system resolves x first: a link made after it (in the same zip
+        # or a later part) put the chain anywhere, and AppRun copied into a link wrote a file outside the install
+        from unittest import mock
+        deep = "a/b/c/d/e/f"
+        chains = (
+            ("climb-after-a-name", [("L", "t/../canary"), ("t", ".")]),
+            ("apprun-through-a-chain", [("AppRun", deep + "/L"), (deep + "/L", "t/../canary"), (deep + "/t", "../" * 6)]),
+        )
+        for label, links in chains:
+            with self.subTest(case=label), tempfile.TemporaryDirectory(prefix="hookshot-chain-") as tmp:
+                home = Path(tmp).resolve() / "home"
+                versions = home / "hookshot" / "builder" / "versions"
+                versions.mkdir(parents=True)
+                canary = versions / "canary"
+                canary.write_bytes(b"canary")
+                archive = io.BytesIO()
+                with zipfile.ZipFile(archive, "w") as zipped:
+                    for name, target in links:
+                        zip_link(zipped, name, target)
+                    zipped.writestr("usr/share/hookshot/builder/linux/AppRun", b"#!/bin/sh\necho changed\n")
+                data = archive.getvalue()
+                part = linux_update.Part(linux_update._sha256(data), len(data), ".", "chain-part", None)
+                with mock.patch.dict(os.environ, {"HOOKSHOT_BUILDER_HOME": str(home)}):
+                    with self.assertRaises(ValueError):
+                        linux_update.install(linux_update.Manifest("v2", [part]), None, None, get=lambda url: data)
+                self.assertEqual(canary.read_bytes(), b"canary")
+                self.assertFalse((versions / "v2").exists())
+                self.assertFalse((versions / "v2.part").exists())
+        # (leading .. stays allowed: the toolchain's links are written that way)
+        with tempfile.TemporaryDirectory(prefix="hookshot-chain-ok-") as tmp:
+            dest = Path(tmp) / "stage"
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, "w") as zipped:
+                zipped.writestr("lib/real", b"real")
+                zip_link(zipped, "bin/alias", "../lib/real")
+            linux_update._unpack(archive.getvalue(), str(dest), None)
+            self.assertEqual((dest / "bin" / "alias").read_bytes(), b"real")
+
+    def test_unpacked_files_are_not_group_or_world_writable(self):
+        with tempfile.TemporaryDirectory(prefix="hookshot-mode-") as tmp:
+            dest = Path(tmp) / "stage"
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, "w") as zipped:
+                for name, mode in (("tool", 0o777), ("data", 0o666), ("setuid", 0o4755)):
+                    info = zipfile.ZipInfo(name)
+                    info.create_system = 3
+                    info.external_attr = (stat.S_IFREG | mode) << 16
+                    zipped.writestr(info, b"x")
+            linux_update._unpack(archive.getvalue(), str(dest), None)
+            self.assertEqual((dest / "tool").stat().st_mode & 0o7777, 0o755)
+            self.assertEqual((dest / "data").stat().st_mode & 0o7777, 0o644)
+            self.assertEqual((dest / "setuid").stat().st_mode & 0o7777, 0o755)
 
     def test_the_button_matches_the_windows_builder(self):
         self.assertEqual(linux_update.choose_mode("v1", "v2", "v2", False, True), "update-game")
@@ -420,7 +661,8 @@ class UpdateTests(unittest.TestCase):
             outside.mkdir()
             marker = outside / "marker"
             marker.write_bytes(b"original")
-            for link_target, member in ((outside, "link/marker"), (marker, "./link")):
+            # The third shape: an absolute target needs no write through the link to escape (#1295)
+            for link_target, member in ((outside, "link/marker"), (marker, "./link"), ("C:/escape" if os.name == "nt" else "/tmp/escape", None)):
                 with self.subTest(member=member):
                     archive = io.BytesIO()
                     with zipfile.ZipFile(archive, "w") as zipped:
@@ -428,8 +670,9 @@ class UpdateTests(unittest.TestCase):
                         link.create_system = 3
                         link.external_attr = (stat.S_IFLNK | 0o777) << 16
                         zipped.writestr(link, str(link_target))
-                        zipped.writestr(member, b"changed")
-                    dest = root / ("directory" if member == "link/marker" else "file")
+                        if member:
+                            zipped.writestr(member, b"changed")
+                    dest = root / ("directory" if member == "link/marker" else "file-abs" if member is None else "file")
                     with self.assertRaises((ValueError, FileExistsError)):
                         linux_update._unpack(archive.getvalue(), str(dest), None)
                     self.assertEqual(marker.read_bytes(), b"original")
@@ -461,16 +704,142 @@ class UpdateTests(unittest.TestCase):
             source = root / "sysroot"
             source.mkdir()
             (source / "lib").symlink_to("usr/lib")
-            (source / "libmvec.so").symlink_to("/lib/x86_64-linux-gnu/libmvec.so.1")
+            (source / "libmvec.so").symlink_to("usr/lib/libmvec.so.1")
             (source / "usr" / "lib").mkdir(parents=True)
             (source / "usr" / "lib" / "marker").write_bytes(b"contents")
+            (source / "usr" / "lib" / "libmvec.so.1").write_bytes(b"library")
             archive = root / "part.zip"
             make_parts.write_zip(str(archive), str(root), "sysroot", None)
             dest = root / "unpacked"
             linux_update._unpack(archive.read_bytes(), str(dest), None)
-            self.assertEqual(os.readlink(dest / "libmvec.so"), "/lib/x86_64-linux-gnu/libmvec.so.1")
+            self.assertEqual(os.readlink(dest / "libmvec.so"), "usr/lib/libmvec.so.1")
+            self.assertEqual((dest / "libmvec.so").read_bytes(), b"library")
             self.assertEqual(os.readlink(dest / "lib"), "usr/lib")
             self.assertEqual((dest / "lib" / "marker").read_bytes(), b"contents")
+
+    def test_a_new_sysroot_part_rebases_rooted_links(self):
+        with tempfile.TemporaryDirectory(prefix="hookshot-zip-") as tmp:
+            root = Path(tmp)
+            sysroot_fixture(root)
+            archive = root / "part.zip"
+            make_parts.write_zip(str(archive), str(root), linux_update.SYSROOT_PART, None)
+            dest = root / "unpacked"
+            linux_update._unpack(archive.read_bytes(), str(dest), None)
+            link = dest / "usr" / "lib" / "x86_64-linux-gnu" / "libmvec.so"
+            self.assertFalse(os.path.isabs(os.readlink(link)))
+            self.assertEqual(link.read_bytes(), b"contents")
+            self.assertEqual(os.readlink(dest / "lib"), "usr/lib")
+
+    def test_a_downloaded_legacy_sysroot_rebases_rooted_links(self):
+        with tempfile.TemporaryDirectory(prefix="hookshot-zip-") as tmp:
+            root = Path(tmp)
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, "w") as zipped:
+                zip_link(zipped, "lib", "usr/lib")
+                zip_link(zipped, "usr/lib/x86_64-linux-gnu/libmvec.so", "/lib/x86_64-linux-gnu/libmvec.so.1")
+                zipped.writestr("usr/lib/x86_64-linux-gnu/libmvec.so.1", b"contents")
+            data = archive.getvalue()
+            with self.assertRaises(ValueError):
+                linux_update._unpack(data, str(root / "ordinary"), None)
+            part = linux_update.Part(linux_update._sha256(data), len(data), linux_update.SYSROOT_PART, "legacy", None)
+            dest = root / "installed"
+            linux_update._place(part, None, None, str(dest), lambda _: data, lambda _: None)
+            link = dest / linux_update.SYSROOT_PART / "usr" / "lib" / "x86_64-linux-gnu" / "libmvec.so"
+            self.assertFalse(os.path.isabs(os.readlink(link)))
+            self.assertEqual(link.read_bytes(), b"contents")
+
+    def test_a_kept_legacy_sysroot_rebases_rooted_links(self):
+        with tempfile.TemporaryDirectory(prefix="hookshot-sysroot-") as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            sysroot_fixture(source)
+            part = linux_update.Part("a" * 64, 1, linux_update.SYSROOT_PART, "unused", None)
+            previous = linux_update.Manifest("old", [part])
+            dest = root / "installed"
+            def no_download(_):
+                self.fail("an unchanged sysroot must not be downloaded")
+            linux_update._place(part, str(source), previous, str(dest), no_download, lambda _: None)
+            link = dest / linux_update.SYSROOT_PART / "usr" / "lib" / "x86_64-linux-gnu" / "libmvec.so"
+            self.assertFalse(os.path.isabs(os.readlink(link)))
+            self.assertEqual(link.read_bytes(), b"contents")
+
+    def test_a_rooted_sysroot_link_cannot_escape_or_be_dangling(self):
+        with tempfile.TemporaryDirectory(prefix="hookshot-sysroot-") as tmp:
+            root = Path(tmp)
+            outside = root / "outside"
+            outside.mkdir()
+            marker = outside / "marker"
+            marker.write_bytes(b"original")
+            for name, link_to, indirect in (("lexical", "/../outside/marker", False),
+                                            ("indirect", "/lib/marker", True),
+                                            ("missing", "/missing", False)):
+                with self.subTest(name=name):
+                    archive = io.BytesIO()
+                    with zipfile.ZipFile(archive, "w") as zipped:
+                        if indirect:
+                            zip_link(zipped, "lib", "../outside")
+                        zip_link(zipped, "link", link_to)
+                    with self.assertRaises(ValueError):
+                        linux_update._unpack(archive.getvalue(), str(root / name), None, rebase_sysroot=True)
+                    self.assertEqual(marker.read_bytes(), b"original")
+                    self.assertFalse((root / name / "link").is_symlink())
+
+    def test_rooted_sysroot_links_resolve_chains_but_not_cycles(self):
+        with tempfile.TemporaryDirectory(prefix="hookshot-sysroot-") as tmp:
+            root = Path(tmp)
+            for name, third in (("chain", True), ("cycle", False)):
+                with self.subTest(name=name):
+                    archive = io.BytesIO()
+                    with zipfile.ZipFile(archive, "w") as zipped:
+                        zip_link(zipped, "first", "/second")
+                        zip_link(zipped, "second", "/third" if third else "/first")
+                        if third:
+                            zipped.writestr("third", b"contents")
+                    dest = root / name
+                    if third:
+                        linux_update._unpack(archive.getvalue(), str(dest), None, rebase_sysroot=True)
+                        self.assertEqual((dest / "first").read_bytes(), b"contents")
+                        self.assertFalse(os.path.isabs(os.readlink(dest / "first")))
+                    else:
+                        with self.assertRaises(ValueError):
+                            linux_update._unpack(archive.getvalue(), str(dest), None, rebase_sysroot=True)
+
+    def test_packaging_refuses_a_sysroot_link_outside_its_root(self):
+        with tempfile.TemporaryDirectory(prefix="hookshot-sysroot-") as tmp:
+            root = Path(tmp)
+            source = root / linux_update.SYSROOT_PART
+            source.mkdir(parents=True)
+            (source / "bad").symlink_to("/../outside")
+            with self.assertRaises(ValueError):
+                make_parts.write_zip(str(root / "part.zip"), str(root), linux_update.SYSROOT_PART, None)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the Linux sysroot copy loop")
+    def test_sysroot_system_aliases_round_trip_as_library_bytes(self):
+        script = (ROOT / "scripts" / "linux" / "appimage.sh").read_text(encoding="utf-8")
+        start = script.index("for f in crt1.o ")
+        loop = script[start:script.index("\ndone", start) + len("\ndone")]
+        with tempfile.TemporaryDirectory(prefix="hookshot-sysroot-") as tmp:
+            root = Path(tmp)
+            system = root / "system"
+            system.mkdir()
+            real = system / "libmvec.so.1"
+            real.write_bytes(b"private library bytes")
+            alias = system / "libmvec.so"
+            alias.symlink_to(real)
+            source = root / "sysroot"
+            (source / "usr" / "lib" / "x86_64-linux-gnu").mkdir(parents=True)
+            (source / "lib").symlink_to("usr/lib")
+            env = dict(os.environ, M=str(system), S=str(source))
+            subprocess.run(["bash", "-euo", "pipefail", "-c", loop], env=env, check=True)
+            copied = source / "usr" / "lib" / "x86_64-linux-gnu" / alias.name
+            self.assertFalse(copied.is_symlink(), "the sysroot must carry the alias's bytes, not an absolute target")
+            archive = root / "part.zip"
+            make_parts.write_zip(str(archive), str(root), "sysroot", None)
+            dest = root / "unpacked"
+            linux_update._unpack(archive.read_bytes(), str(dest), None)
+            self.assertEqual((dest / "lib" / "x86_64-linux-gnu" / alias.name).read_bytes(), real.read_bytes())
+            self.assertEqual(os.readlink(alias), str(real))
+            self.assertEqual(real.read_bytes(), b"private library bytes")
 
 
 if __name__ == "__main__":

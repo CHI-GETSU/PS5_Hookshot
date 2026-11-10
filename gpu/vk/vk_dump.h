@@ -26,7 +26,7 @@ void dump_buffer(VkCommandBuffer cmd, VkBuffer src, VkDeviceSize off, VkDeviceSi
 bool dump_pending();
 /// Writes and frees the copies (their submission completed)
 void dump_write();
-/// The PNG writer (vk_replay.cpp): rgba is w x h RGBA8, the alpha left out
-void write_png(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h);
+/// Publish a complete PNG (vk_replay.cpp): rgba is w x h RGBA8, alpha left out. False preserves an old destination.
+bool write_png(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h);
 
 } // namespace mkwvk

@@ -28,6 +28,7 @@ os.environ.setdefault("OOT_WORK", os.path.join(ROOT, "work", "lift"))
 import kit       # noqa: E402  (nx2: the lift's paths)
 import rtgen     # noqa: E402  (the 64-bit guest window's runtime header)
 import logo_rgba  # noqa: E402
+import ui_fonts   # noqa: E402  (the overlays' bundled fonts, compiled in)
 import version   # noqa: E402
 
 SDK = os.environ.get("PS5_PAYLOAD_SDK", os.path.join(ROOT, "..", "PS5_VulkanTemplate", ".deps", "native", "ps5-payload-sdk"))
@@ -97,13 +98,12 @@ def jobs_for(rt64, gen_dir):
                         "-I" + os.path.join(pkg("vulkanheaders", "v1.4.345"), "include")]
     skip = {"display.c", "mf_av1.c", "rx_nowgpu.c", "pgo_rt.c", "hos_sdl.c", "mingw_msvc_shims.c", "msvc_oldnames.c"}
     host = [os.path.join(HOST, f) for f in sorted(os.listdir(HOST)) if f.endswith(".c") and f not in skip] + \
-        [os.path.join(POSIX, f) for f in ("win32_posix.c", "display_sdl.c", "linux_stubs.c", "gdi_posix.c")] + \
+        [os.path.join(POSIX, f) for f in ("win32_posix.c", "display_sdl.c", "linux_stubs.c")] + \
         [os.path.join(PS5, f) for f in sorted(os.listdir(PS5)) if f.endswith(".c")]
     stamp = version.define(ROOT)
     for s in host:
         rel = os.path.relpath(s, HOST).replace(os.sep, "_")[:-2]
-        fl = host_fl + ([stamp] if os.path.basename(s) == "hos_main.c" else []) + \
-            (["-I" + os.path.join(ROOT, "third_party", "stb")] if os.path.basename(s) == "gdi_posix.c" else [])
+        fl = host_fl + ([stamp] if os.path.basename(s) == "hos_main.c" else [])
         out.append((s, os.path.join(OUT, "obj", "host_" + rel + ".o"), fl, host_digest))
 
     # libopus (nn::codec's Opus decoder)
@@ -140,6 +140,17 @@ def jobs_for(rt64, gen_dir):
     lib_digest = tree_digest(os.path.join(VK, "eden"), os.path.join(VK, "sirit"), os.path.join(VK, "compat"))
     vk_digest = tree_digest(VK, os.path.join(ROOT, "gpu", "compat"), os.path.join(ROOT, "gpu", "render"), POSIX, PS5,
                             os.path.join(ROOT, "gpu", "third_party", "suyu", "video_core", "textures"))
+    # Dear ImGui (the menu and the overlays: vk_imgui.cpp, vk_menu.cpp), as nx2/build.py compiles it; the game's font files
+    # are zstd frames, read with the console's zstd (ps5/tools/build-zstd.sh), not third_party/zstd's second copy
+    imgui = os.path.join(ROOT, "third_party", "imgui")
+    imgui_fl = ["-I" + imgui, "-I" + os.path.join(DEPS, "zstd", "include"), "-DIMGUI_IMPL_VULKAN_NO_PROTOTYPES",
+                "-DIMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS", "-DIMGUI_DISABLE_WIN32_FUNCTIONS", "-DIMGUI_DISABLE_DEMO_WINDOWS",
+                "-DIMGUI_DISABLE_DEBUG_TOOLS"]
+    imgui_digest = tree_digest(imgui, os.path.join(DEPS, "zstd", "include"))
+    for f in ("imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp", "backends/imgui_impl_vulkan.cpp"):
+        out.append((os.path.join(imgui, *f.split("/")), os.path.join(OUT, "obj", "vk_imgui_" + os.path.basename(f)[:-4] + ".o"),
+                    vfl + imgui_fl, imgui_digest))
+    out.append((os.path.join(gen_dir, "ui_fonts.cpp"), os.path.join(OUT, "obj", "vk_ui_fonts.o"), COMMON + ["-O0", "-w"], ""))
     for s in upstream.vk_sources():
         if os.path.basename(s) == "vk_ngx_msvc_rt.cpp":
             continue
@@ -147,9 +158,11 @@ def jobs_for(rt64, gen_dir):
         lib = os.path.relpath(s, VK).split(os.sep)[0] in ("eden", "sirit")
         fl = vfl + ([shader_stamp] if os.path.basename(s) == "vk_shader.cpp" else []) + \
             ([stamp] if os.path.basename(s) == "vk_menu.cpp" else []) + \
+            (imgui_fl if os.path.basename(s) in ("vk_imgui.cpp", "vk_menu.cpp") else []) + \
             (["-DHOOKSHOT_MIHAWKGEN", "-I" + os.path.join(MIHAWKGEN, "framegen", "include")]
              if HAS_MIHAWKGEN and os.path.basename(s) == "vk_framegen.cpp" else [])
-        out.append((s, os.path.join(OUT, "obj", "vk_" + rel + ".o"), fl, lib_digest if lib else vk_digest))
+        out.append((s, os.path.join(OUT, "obj", "vk_" + rel + ".o"), fl,
+                    lib_digest if lib else vk_digest + (imgui_digest if os.path.basename(s) in ("vk_imgui.cpp", "vk_menu.cpp") else "")))
     if HAS_MIHAWKGEN:   # (its Vulkan calls through the back end's loaded pointers: vk_loader.h, as every unit of gpu/vk)
         mfl = vfl + ["-include", os.path.join(VK, "vk_loader.h"), "-I" + os.path.join(MIHAWKGEN, "framegen", "include"),
                      "-I" + os.path.join(MIHAWKGEN, "framegen", "src")]
@@ -200,6 +213,7 @@ def main():
     rt64 = rtgen.write(os.path.join(OUT, "rt64"))
     gen_dir = os.path.join(OUT, "gen")
     logo_rgba.write(os.path.join(gen_dir, "hookshot_logo.h"))
+    ui_fonts.write(os.path.join(gen_dir, "ui_fonts.cpp"))
     jobs = jobs_for(rt64, gen_dir)
     # the longest first (the lifted chunks), so no long compile is left alone at the end
     jobs.sort(key=lambda j: -os.path.getsize(j[0]))

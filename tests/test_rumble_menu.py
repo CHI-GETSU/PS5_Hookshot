@@ -1,8 +1,8 @@
 """The Insert menu's Rumble strength row (Controls): Off, 25% to 150% in steps of 25, stopping at its ends.
 
-gpu/vk/vk_menu.cpp's row, set_row (the arrows, Enter and a click on the value), the mouse wheel's loop and the ini's
-snap to the row's steps are compiled from the source with stubs and run: one step below Off stays Off, one above 150%
-stays 150%, however it is asked. The option id the host reads it by (9, host/pad_sdl.c) is checked against the
+gpu/vk/vk_menu.cpp's row, set_row (the arrows, Enter and a click on the value) and the ini's snap to the row's steps are
+compiled from the source with stubs and run: one step below Off stays Off, one above 150% stays 150%, however it is
+asked. The mouse wheel never changes a value (it scrolls the rows): menu_tick is checked for that. The option id the host reads it by (9, host/pad_sdl.c) is checked against the
 renderer's option table (gpu/vk/vk_replay.cpp) and the other ids.
 
     python -I -B tests/test_rumble_menu.py [--cxx g++]
@@ -86,12 +86,6 @@ void mic_chosen() {}
 // (set_row steps the Output row through vk_menu.cpp's step_output_choice (#1144): not what this checks)
 int step_output_choice(int id, int dir) { return id + dir; }
 %(set_row)s
-/* (menu_tick's wheel over a value, as in the source) */
-void wheel(Row& d, int amount) {
-    struct { int wheel; } ptr = {amount};
-    const int dir = ptr.wheel > 0 ? 1 : -1;
-    %(wheel)s
-}
 /* (menu_tick's arrows: Left, Right, and Enter as Right; a click on the value's left or right half presses them) */
 void arrow(Row& r, bool right) { %(arrow)s }
 int main() {
@@ -116,19 +110,6 @@ int main() {
     CHECK(opts.rumble == 150);
     set_row(r, -25, -1);
     CHECK(opts.rumble == 0);
-    /* the wheel: several notches at once stop at the end, they do not go round */
-    opts.rumble = 25;
-    wheel(r, -3);
-    CHECK(opts.rumble == 0);
-    wheel(r, -1);
-    CHECK(opts.rumble == 0);
-    opts.rumble = 125;
-    wheel(r, 5);
-    CHECK(opts.rumble == 150);
-    wheel(r, 1);
-    CHECK(opts.rumble == 150);
-    wheel(r, -2);
-    CHECK(opts.rumble == 100);
     /* it is a control: the quality preset stays */
     CHECK(opts.preset == 3 && presets == 0 && saves > 0);
     /* an ini's value: on the steps, within the range */
@@ -138,6 +119,24 @@ int main() {
     return 0;
 }
 """
+
+
+def wheel_free(menu):
+    """the wheel scrolls the rows, the Controls page and the lists, and changes no value, selection or tab"""
+    tick = menu[menu.index("void menu_tick() {"):]
+    if not re.search(r"if \(ptr\.wheel && drag_row < 0\) wheel_rows\[cur_tab\] \+= ptr\.wheel, changed = true;", tick):
+        raise SystemExit("FAIL: the wheel on the tabs does not scroll the rows")
+    if "if (ptr.wheel) wheel_rows[kControlsSlot] += ptr.wheel" not in tick:
+        raise SystemExit("FAIL: the wheel on the Controls page does not scroll it")
+    lists = menu[menu.index("void list_mouse("):menu.index("void teleport_reveal()")]
+    if "scroll = std::max(0, std::min(scroll - ptr.wheel" not in lists or re.search(r"choice\s*=[^;]*ptr\.wheel", lists):
+        raise SystemExit("FAIL: the wheel on a list does not scroll it, or moves the choice")
+    for line in (menu[menu.index("void list_mouse("):]).splitlines():
+        if "ptr.wheel" in line and re.search(r"set_row|press\[[34]\]|ask_sel|tab_left|tab_right|\bsel =|csel =", line):
+            raise SystemExit("FAIL: the wheel still changes something: " + line.strip())
+    scroll = menu[menu.index("float scroll_rows("):menu.index("void scroll_bar(")]
+    if "if (n <= fit) want = 0;" not in scroll or "want -= (float)wheel;" not in scroll:
+        raise SystemExit("FAIL: scroll_rows does not scroll by the wheel, or scrolls a list that fits")
 
 
 def menu_fixture():
@@ -151,8 +150,7 @@ def menu_fixture():
     load = block(menu, menu.rindex('if (FILE* f = fopen(ini_path().c_str(), "r"))', 0, load))
     if "opts.rumble = rumble_step(opts.rumble);" not in load:
         raise SystemExit("the ini's Rumble strength is not put on the row's steps")
-    tick = menu[menu.index("if (ptr.wheel && drag_row < 0)"):]
-    loop = tick.index("for (int n = ptr.wheel > 0 ? ptr.wheel : -ptr.wheel; n > 0; n--)")
+    wheel_free(menu)
     arrow = re.search(r"\n\s*(set_row\(r, \*r\.value \+ \(press\[4\] \? r\.step : -r\.step\), press\[4\] \? 1 : -1\);)", menu)
     if not arrow:
         raise SystemExit("the arrows no longer step a row with set_row")
@@ -165,7 +163,6 @@ def menu_fixture():
         "snap": one_line(menu, "int rumble_step"),
         "ini_key": definition(menu, "const char* ini_key"),
         "set_row": definition(menu, "void set_row"),
-        "wheel": block(tick, loop),
         "arrow": "bool press[5] = {false, false, false, !right, right}; " + arrow.group(1),
         "exempt": ", nullptr, false, true" if exempt else "",   # (after the help: no hint, no restart)
         "lo": row.group(1), "hi": row.group(2), "step": row.group(3),

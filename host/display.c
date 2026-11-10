@@ -7,7 +7,9 @@
    HOS_WINDOW_SIZE=<w>x<h>: the client area (default 1280x720 at 96 dpi). F11 or Alt+Enter: fullscreen.
    Mouse: a click in the window captures the mouse (hidden, kept in the window), Esc or leaving the window releases
    it (nn_hid.c reads its motion). While the Insert menu is open the mouse is free (the cursor shown, for the menu's
-   clicks: hos_mouse_pointer) and the game gets none of it; the capture it had comes back when the menu closes. */
+   clicks: hos_mouse_pointer) and the game gets none of it; the capture it had comes back when the menu closes. The same
+   while one of the game's own menus is open (host/oot_menu.c: hos_mouse_game_menu each frame it runs), its clicks and
+   wheel for that menu (hos_mouse_game_pointer). */
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,6 +50,23 @@ void hos_mouse_give_back(int32_t dx, int32_t dy) {
 /* the free mouse, for the Insert menu (gpu/vk/vk_api.h MkwVkPointer): set on the window's thread, read on the renderer's */
 static volatile LONG ptr_x, ptr_y, ptr_w, ptr_h, ptr_in, ptr_pressed, ptr_wheel;   /* (client pixels; wheel in WHEEL_DELTA units) */
 static int menu_open, captured_before_menu;
+/* the game's own menus: open while one of their screens runs with the mouse (stamped each frame on the
+   game's thread), their clicks */
+static int game_menu_open;
+static volatile LONG64 game_menu_seen_ns;
+static volatile LONG gm_pressed, gm_wheel;
+/* The cursor over the game's menus is hidden until the mouse is used (moved or a button pressed) and again once the
+   pads or the keys are (nn_hid.c: hos_player_input_ns): a player on a controller never sees it, and a mouse at rest
+   takes no part (no pointing or clicks while hidden). The wheel works hidden too, and does not show it: a button held
+   (R, for the item choice) counts as the pad in use, and hid the cursor again at each notch */
+int64_t hos_player_input_ns(void);
+static volatile LONG gm_shown, gm_mx = -1, gm_my = -1;
+static volatile LONG64 gm_mouse_ns;
+static void gm_mouse_used(void) { InterlockedExchange64(&gm_mouse_ns, (LONG64)hos_now_ns()); InterlockedExchange(&gm_shown, 1); }
+static int gm_cursor_shown(void) {
+    if (gm_shown && hos_player_input_ns() > InterlockedCompareExchange64(&gm_mouse_ns, 0, 0)) InterlockedExchange(&gm_shown, 0);
+    return (int)gm_shown;
+}
 
 int hos_mouse_pointer(MkwVkPointer *out) {
     memset(out, 0, sizeof *out);
@@ -122,18 +141,80 @@ static void mouse_capture(HWND w, int on) {
     }
 }
 
-/* the menu opened: the mouse let go (its capture kept for later); closed: the capture back, if the window still has the focus */
-static void menu_mouse(HWND w, int open) {
-    if (open == menu_open) return;
-    menu_open = open;
-    if (open) {
+/* the cursor hidden now while it is over the window (not at the next move's WM_SETCURSOR) */
+static void gm_cursor_off(HWND w) {
+    POINT p;
+    RECT rc;
+    if (GetCursorPos(&p) && ScreenToClient(w, &p) && GetClientRect(w, &rc) && PtInRect(&rc, p)) SetCursor(NULL);
+}
+/* a menu opened (the Insert menu or the game's): the mouse let go (its capture kept for later); both closed: the capture
+   back, if the window still has the focus */
+static void menus_mouse(HWND w, int insert_open, int game_open) {
+    const int was = menu_open || game_menu_open, now = insert_open || game_open, game_was = game_menu_open;
+    menu_open = insert_open, game_menu_open = game_open;
+    /* (hidden till used; a menu back within a second, a moment between its screens, keeps the cursor as it was) */
+    static int64_t game_closed_ns;
+    if (!game_open && game_was) game_closed_ns = hos_now_ns();
+    if (game_open && !game_was && (!game_closed_ns || hos_now_ns() - game_closed_ns > 1000000000LL))
+        InterlockedExchange(&gm_shown, 0), gm_mx = ptr_x, gm_my = ptr_y;
+    if (now && !was) {
         captured_before_menu = (int)mouse_captured;
         mouse_capture(w, 0);
-        InterlockedExchange(&ptr_pressed, 0), InterlockedExchange(&ptr_wheel, 0);
-    } else {
+    } else if (!now && was) {
         if (captured_before_menu && GetForegroundWindow() == w) mouse_capture(w, 1);
         captured_before_menu = 0;
     }
+    /* (a game menu opened: its cursor hidden till the mouse is used, at once; the release above showed it) */
+    if (game_open && !game_was && !insert_open) gm_cursor_off(w);
+    InterlockedExchange(&ptr_pressed, 0), InterlockedExchange(&ptr_wheel, 0);
+    InterlockedExchange(&gm_pressed, 0), InterlockedExchange(&gm_wheel, 0);
+}
+static void menu_mouse(HWND w, int open) {
+    if (open != menu_open) menus_mouse(w, open, game_menu_open);
+}
+
+/* (host/oot_menu.c, the game's thread) one of the game's menus ran this frame */
+void hos_mouse_game_menu(void) {
+    const LONG64 before = InterlockedExchange64(&game_menu_seen_ns, (LONG64)hos_now_ns());
+    if (!before && hwnd) PostMessageA(hwnd, WM_APP + 10, 1, 0);
+}
+/* (host/oot_menu.c, the game's thread) frames go on with none of the game's menus holding the mouse: closed now */
+void hos_mouse_game_menu_gone(void) {
+    const LONG64 seen = InterlockedCompareExchange64(&game_menu_seen_ns, 0, 0);
+    if (seen && hwnd && InterlockedCompareExchange64(&game_menu_seen_ns, 0, seen) == seen) PostMessageA(hwnd, WM_APP + 11, 0, 0);
+}
+/* (host/oot_menu.c, the game's thread) the wheel's notches since the last call, for a screen that takes only the wheel
+   and leaves the mouse as it is (the R button's item choice, in play: the mouse the camera's). Notches count only while
+   such a screen reads them (a call in the last 200 ms): a wheel turned in play does not wait for the next one */
+static volatile LONG play_wheel;
+static volatile LONG64 play_wheel_ns;
+int hos_mouse_wheel_take(void) {
+    InterlockedExchange64(&play_wheel_ns, (LONG64)hos_now_ns());
+    const LONG wl = InterlockedExchange(&play_wheel, 0);
+    if (!hwnd || menu_open || GetForegroundWindow() != hwnd) return 0;
+    if (wl % WHEEL_DELTA) InterlockedExchangeAdd(&play_wheel, wl % WHEEL_DELTA);
+    return wl / WHEEL_DELTA;
+}
+/* the free mouse over the game's menus: its position (client pixels) and the window's size, the buttons pressed
+   (HOS_MOUSE_*) and the wheel's notches since the last call. 0 when the Insert menu has it or it is outside the window;
+   2 while the cursor is hidden: the wheel only (no presses; the position is not one to point with) */
+int hos_mouse_game_pointer(int *x, int *y, int *w, int *h, uint32_t *pressed, int *wheel) {
+    *pressed = 0, *wheel = 0;
+    if (!hwnd || !game_menu_open || menu_open || mouse_captured) return 0;
+    const int shown = gm_cursor_shown();
+    *x = ptr_x, *y = ptr_y, *w = ptr_w, *h = ptr_h;
+    const LONG got = InterlockedExchange(&gm_pressed, 0);   /* (hidden: what the buttons did meanwhile is not the menu's) */
+    if (shown) *pressed = (uint32_t)got;
+    const LONG wl = InterlockedExchange(&gm_wheel, 0);
+    *wheel = wl / WHEEL_DELTA;
+    if (wl % WHEEL_DELTA) InterlockedExchangeAdd(&gm_wheel, wl % WHEEL_DELTA);
+    if (!(ptr_in && GetForegroundWindow() == hwnd && *w > 0 && *h > 0)) return 0;
+    return shown ? 1 : 2;
+}
+static void game_menu_press(LPARAM lp, LONG bit) {
+    ptr_x = (short)LOWORD(lp), ptr_y = (short)HIWORD(lp), ptr_in = 1;
+    gm_mouse_used();
+    InterlockedOr(&gm_pressed, bit);
 }
 static void menu_press(HWND w, LPARAM lp, LONG bit) {   /* (a click while the menu is open: the menu's) */
     ptr_x = (short)LOWORD(lp), ptr_y = (short)HIWORD(lp), ptr_in = 1;
@@ -145,6 +226,10 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_MOUSEMOVE:
         ptr_x = (short)LOWORD(lp), ptr_y = (short)HIWORD(lp);
+        if (game_menu_open && !menu_open && (ptr_x != gm_mx || ptr_y != gm_my)) {   /* (a move: not a repeat at rest) */
+            gm_mx = ptr_x, gm_my = ptr_y;
+            gm_mouse_used();
+        }
         if (!ptr_in) {
             TRACKMOUSEEVENT t = {sizeof t, TME_LEAVE, w, 0};
             TrackMouseEvent(&t);
@@ -156,12 +241,17 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_MOUSEWHEEL:
         if (menu_open) InterlockedExchangeAdd(&ptr_wheel, GET_WHEEL_DELTA_WPARAM(wp));
+        else if (game_menu_open) InterlockedExchangeAdd(&gm_wheel, GET_WHEEL_DELTA_WPARAM(wp));   /* (hidden or not) */
+        else if ((LONG64)hos_now_ns() - InterlockedCompareExchange64(&play_wheel_ns, 0, 0) < 200000000LL)
+            InterlockedExchangeAdd(&play_wheel, GET_WHEEL_DELTA_WPARAM(wp));   /* (a screen that takes the wheel only) */
         return 0;
     case WM_RBUTTONDOWN:
         if (menu_open) menu_press(w, lp, HOS_MOUSE_RIGHT);
+        else if (game_menu_open) game_menu_press(lp, HOS_MOUSE_RIGHT);
         return 0;
     case WM_MBUTTONDOWN:
         if (menu_open) menu_press(w, lp, HOS_MOUSE_MIDDLE);
+        else if (game_menu_open) game_menu_press(lp, HOS_MOUSE_MIDDLE);
         return 0;
     case WM_LBUTTONUP:
     case WM_RBUTTONUP:
@@ -171,8 +261,33 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP + 8:   /* (the Insert menu opened or closed: gpu/vk/vk_menu.cpp) */
         menu_mouse(w, (int)wp);
         return 0;
-    case WM_TIMER:
+    case WM_APP + 10:   /* (a game menu opened: hos_mouse_game_menu) */
+        if (!game_menu_open) menus_mouse(w, menu_open, 1);
         return 0;
+    case WM_APP + 11:   /* (the game's menus closed: hos_mouse_game_menu_gone) */
+        if (game_menu_open) menus_mouse(w, menu_open, 0);
+        return 0;
+    case WM_TIMER: {
+        /* (hookshot, #1532) a controller is not input to Windows: playing with one, the display went off at the power
+           plan's timeout. While the game's window is in front and not minimized, the display's idle timer is reset every
+           30 s (ES_DISPLAY_REQUIRED without ES_CONTINUOUS: nothing is held when the game is left or closed).
+           HOS_KEEP_DISPLAY=0: Windows' timeout as before */
+        static ULONGLONG last_awake;
+        static int keep = -1;
+        if (keep < 0) keep = !getenv("HOS_KEEP_DISPLAY") || atoi(getenv("HOS_KEEP_DISPLAY")) != 0;
+        const ULONGLONG now = GetTickCount64();
+        if (keep && renderer && now - last_awake >= 30000 && GetForegroundWindow() == w && !IsIconic(w)) {
+            last_awake = now;
+            SetThreadExecutionState(ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+        }
+        /* (the game's menus closed: no frame of one for 300 ms) */
+        const LONG64 seen = InterlockedCompareExchange64(&game_menu_seen_ns, 0, 0);
+        if (game_menu_open && seen && (LONG64)hos_now_ns() - seen > 300000000LL &&
+            InterlockedCompareExchange64(&game_menu_seen_ns, 0, seen) == seen)
+            menus_mouse(w, menu_open, 0);
+        if (game_menu_open && !menu_open && !gm_cursor_shown()) gm_cursor_off(w);   /* (hidden by the pads or keys: at once) */
+        return 0;
+    }
     case WM_SYSCOMMAND:
         if ((wp & 0xFFF0) == SC_SCREENSAVE && !(wp & SCF_ISSECURE) &&
             renderer && GetForegroundWindow() == w && !IsIconic(w)) {
@@ -192,13 +307,17 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_LBUTTONDOWN:
         if (menu_open) menu_press(w, lp, HOS_MOUSE_LEFT);
+        else if (game_menu_open) game_menu_press(lp, HOS_MOUSE_LEFT);
         else if (renderer && !mouse_captured) mouse_capture(w, 1);
         return 0;
     case WM_KEYDOWN: {
         extern void hos_vk_note_key_press(unsigned key);
         if (!(lp & (1 << 30))) hos_vk_note_key_press((unsigned)wp);
         if (wp == VK_ESCAPE) mouse_capture(w, 0);
-        if (wp == VK_F11 && !(lp & (1 << 30))) set_fullscreen(w, !fullscreen);
+        if (wp == VK_F11 && !(lp & (1 << 30))) {
+            const int mod = (GetKeyState(VK_SHIFT) | GetKeyState(VK_CONTROL) | GetKeyState(VK_MENU)) & 0x8000;
+            if (!mod) set_fullscreen(w, !fullscreen);
+        }
         return 0;
     }
     case WM_SYSKEYDOWN:   /* Alt+Enter, as on Linux (display_sdl.c); other Alt keys (Alt+F4) go on to Windows */
@@ -225,7 +344,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         mouse_capture(w, 0);
         break;
     case WM_SETCURSOR:
-        if (mouse_captured && LOWORD(lp) == HTCLIENT) {
+        if ((mouse_captured || (game_menu_open && !menu_open && !gm_cursor_shown())) && LOWORD(lp) == HTCLIENT) {
             SetCursor(NULL);
             return TRUE;
         }

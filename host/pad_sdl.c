@@ -46,6 +46,8 @@ static struct {
     int motion, motion_on;
     int64_t motion_retry_ns, used_ns;
     uint64_t input_sig;
+    unsigned rested;   /* (hookshot) the sticks' axes seen at rest since it was opened, a bit each: only those steer */
+    signed char held[4];   /* (the way each axis was last held, -1, 0 or 1: one held the other way has passed its rest) */
     uint32_t serial;
     float bias[3], bias_t;
     int has_bias;
@@ -310,6 +312,8 @@ static void pads_poll(void) {
                 pads[slot].motion_on = 0;
                 pads[slot].motion_retry_ns = 0;
                 pads[slot].used_ns = now, pads[slot].input_sig = 0;   /* (just connected: the one about to be used) */
+                pads[slot].rested = 0;
+                memset(pads[slot].held, 0, sizeof pads[slot].held);
                 pads[slot].serial = ++pads_opened;
                 pads[slot].has_bias = 0;
                 hos_log("hid: controller \"%s\" connected (SDL)%s", hos_sdl_pad_name(gc),
@@ -348,10 +352,21 @@ static void pads_poll(void) {
             const int inv_x = rx_option(16, 0);
             const int inv_y = rx_option(17, 0);
             const int z = rx_option(11, 0);   /* (the menu's Stick dead zone: nn_hid.c's hos_stick_axis) */
-            const int32_t v[4] = {stick_value(hos_sdl_pad_axis(gc, AX_LX), 0, z),
-                                  stick_value(hos_sdl_pad_axis(gc, AX_LY), 1, z),
-                                  stick_value(hos_sdl_pad_axis(gc, AX_RX), inv_x, z),
-                                  stick_value(hos_sdl_pad_axis(gc, AX_RY), inv_y ? 0 : 1, z)};
+            int32_t v[4] = {stick_value(hos_sdl_pad_axis(gc, AX_LX), 0, z),
+                            stick_value(hos_sdl_pad_axis(gc, AX_LY), 1, z),
+                            stick_value(hos_sdl_pad_axis(gc, AX_RX), inv_x, z),
+                            stick_value(hos_sdl_pad_axis(gc, AX_RY), inv_y ? 0 : 1, z)};
+            /* (hookshot) An axis steers once it has been seen at rest (inside the dead zone) since the pad was opened. The sticks are
+               the strongest of all the pads', so a device whose axis reads held for good (a mapping that puts a trigger or an
+               unused axis on a stick, a second virtual pad) turned the camera or walked Link in circles on its own, with the
+               player's pad at rest (#1673: Xbox 360 pad, CachyOS; #1661: GameSir 2 Lite, wired). A real stick rests at the start. */
+            /* (a worn stick resting just past a small dead zone counts once it is pushed the other way: it went past its rest) */
+            for (int k = 0; k < 4; k++) {
+                const signed char way = (signed char)(v[k] > 0 ? 1 : v[k] < 0 ? -1 : 0);
+                if (!way || (pads[i].held[k] && way != pads[i].held[k])) pads[i].rested |= 1u << k;
+                pads[i].held[k] = way;
+                if (!(pads[i].rested >> k & 1)) v[k] = 0;
+            }
             for (int k = 0; k < 4; k++)
                 if ((v[k] < 0 ? -v[k] : v[k]) > (s[k] < 0 ? -s[k] : s[k])) s[k] = v[k];
             {   /* (motion: the pad last used; a stick counts by which way it is pushed, not by how far) */

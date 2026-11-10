@@ -69,10 +69,15 @@ def skip(why):
 
 
 def compiler(given, env, names, build_name):
-    """--cc/--cxx, else $CC/$CXX, else PATH, else the toolchain the build itself uses (emsdk, HOOKSHOT_MINGW)"""
+    """--cc/--cxx, else $CC/$CXX, else HOOKSHOT_MINGW's when it is set (target_flags gives its target and runtime, which
+    another clang on PATH cannot use), else PATH, else the toolchain the build itself uses (emsdk)"""
     for c in (given, os.environ.get(env)):
         if c:
             return shutil.which(c) or (c if os.path.isfile(c) else None)
+    if toolchain.mingw(host=True):
+        c = toolchain.find(build_name, host=True)
+        if os.path.isfile(c):
+            return c
     for n in names:
         if shutil.which(n):
             return shutil.which(n)

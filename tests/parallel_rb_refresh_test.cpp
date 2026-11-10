@@ -103,6 +103,7 @@ uint64_t gpu_pool_end(uint64_t gpu) {
 }
 
 thread_local VkCommandBuffer last_barrier_cmd = VK_NULL_HANDLE;
+thread_local VkCommandBuffer last_pass_end_cmd = VK_NULL_HANDLE;
 thread_local VkCommandBuffer up_cmd = VK_NULL_HANDLE;
 uint64_t rec_value = 0;
 thread_local bool up_used = false;
@@ -173,7 +174,12 @@ struct Rec {
 std::vector<FakeCB*> cbs;
 Rec begin_recording(const char* name) {   // (vk_replay.cpp begin_recording: then texture_begin_recording)
     Rec r{new FakeCB{std::string(name) + ".cmd", {}}, new FakeCB{std::string(name) + ".up", {}}};
+    last_pass_end_cmd = r.cmd;
     texture_begin_recording(r.up, 1);
+    if (last_pass_end_cmd != VK_NULL_HANDLE) {
+        std::fputs("a new recording kept the previous pass-end command buffer\n", stderr);
+        std::exit(1);
+    }
     return r;
 }
 void submit(const Rec& r) {   // (submit_recording: the uploads, the refresh last of them, ahead of the work)
