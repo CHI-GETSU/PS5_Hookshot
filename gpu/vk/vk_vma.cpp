@@ -38,7 +38,15 @@ VmaPool image_pool = VK_NULL_HANDLE;
 bool image_pool_tried = false;
 // (RX_VK_IMAGE_BLOCK_MB=<n>, 16 and up: the block's size. VMA keeps one block empty for the next image, 128 MB of VRAM that a 64 MB block
 // would halve, at twice the memory objects: the driver allows ~4096, the imported pools take ~2400)
-const uint64_t kImageBlock = (getenv("RX_VK_IMAGE_BLOCK_MB") ? (uint64_t)std::max(16, atoi(getenv("RX_VK_IMAGE_BLOCK_MB"))) : 128u) << 20;
+// (PS5: 32 MB. The game's pages, the heap and these blocks share the console's one pool, and a block goes back to it only
+// once empty: as textures were made smaller for lack of memory, 536 MB stayed free inside the 128 MB blocks (10 blocks
+// 1280 MB for 744 MB of images) while the game's next page found none, leaving Hyrule Castle Town)
+#ifdef __PROSPERO__
+constexpr unsigned kImageBlockMb = 32;
+#else
+constexpr unsigned kImageBlockMb = 128;
+#endif
+const uint64_t kImageBlock = (getenv("RX_VK_IMAGE_BLOCK_MB") ? (uint64_t)std::max(16, atoi(getenv("RX_VK_IMAGE_BLOCK_MB"))) : kImageBlockMb) << 20;
 
 // (hookshot) and the render targets' images in blocks of their own (texture_get's for a target: OoT's transient ones, made and let go
 // all the time). In the same blocks as the textures that stay, each one gone left a hole beside a texture that kept its block: the

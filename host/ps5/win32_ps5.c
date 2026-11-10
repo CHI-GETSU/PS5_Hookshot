@@ -137,11 +137,7 @@ static int commit_units(uintptr_t lo, uintptr_t hi) {
                 free_count -= k;
                 phys = free_units[free_count], got = k * UNIT;
             } else phys = direct_take(need, &got);
-            if (phys < 0) {
-                hos_ps5_klog_now("[ps5] guest commit: no direct memory left (%llu MiB committed)",
-                                 (unsigned long long)(committed_bytes >> 20));
-                return 0;
-            }
+            if (phys < 0) return 0;   /* (commit_units_wait says so) */
             void *want = (void *)(HOS_PS5_GUEST_LO + u * UNIT), *at = want;
             const int r = sceKernelMapDirectMemory(&at, got, PS5_KERNEL_PROT_CPU_READ | PS5_KERNEL_PROT_CPU_WRITE | GPU_RW,
                                                    PS5_KERNEL_MAP_FIXED, phys, UNIT);
@@ -163,6 +159,29 @@ static int commit_units(uintptr_t lo, uintptr_t hi) {
     if (now_ms() - commit_t0 >= 20)
         hos_ps5_klog_now("[ps5] guest commit: %llu MiB backed in %.0f ms", (unsigned long long)(commit_bytes >> 20), now_ms() - commit_t0);
     return 1;
+}
+
+/* commit_units, waiting for memory when there is none: the game gives an area's pages back while it loads the next (leaving
+   Hyrule Castle Town a worker's page found none with 85 MiB free, and the game was gone), the renderer's emptied blocks and
+   the heap's free segments go back too. Tried again for up to 3 s before the caller is told no; window_lock held on
+   entry and on return, not while waiting */
+static int commit_units_wait(uintptr_t lo, uintptr_t hi) {
+    for (int tries = 0;; tries++) {
+        if (commit_units(lo, hi)) {
+            if (tries) hos_ps5_klog_now("[ps5] guest commit: memory found after %d ms", tries * 20);
+            return 1;
+        }
+        if (!tries || tries == 150)
+            hos_ps5_klog_now("[ps5] guest commit: no direct memory left (%llu MiB committed)%s",
+                             (unsigned long long)(committed_bytes >> 20), tries ? "" : ": waiting for some");
+        if (tries == 150) return 0;
+        pthread_mutex_unlock(&window_lock);
+#ifdef PS5_HEAP_TRIM
+        if (!tries) ps5_heap_trim();
+#endif
+        sceKernelUsleep(20000);
+        pthread_mutex_lock(&window_lock);
+    }
 }
 
 int hos_ps5_unit_backed(uintptr_t addr);
@@ -263,7 +282,7 @@ void *VirtualAlloc(void *addr, SIZE_T size, DWORD type, DWORD protect) {
            buffers, the renderer's imported pools). */
         if (size >= LAZY_COMMIT) return addr;
         pthread_mutex_lock(&window_lock);
-        const int ok = window_reserved && commit_units(a & ~(uintptr_t)(UNIT - 1), a + size);
+        const int ok = window_reserved && commit_units_wait(a & ~(uintptr_t)(UNIT - 1), a + size);
         pthread_mutex_unlock(&window_lock);
         if (!ok) { set_error(ERROR_COMMITMENT_LIMIT); return NULL; }
         return addr;
@@ -291,7 +310,7 @@ int hos_ps5_commit_now(void *addr, size_t size) {
     const uintptr_t a = (uintptr_t)addr;
     if (!size || !in_window(a, a + size)) return 1;
     pthread_mutex_lock(&window_lock);
-    const int ok = window_reserved && commit_units(a & ~(uintptr_t)(UNIT - 1), a + size);
+    const int ok = window_reserved && commit_units_wait(a & ~(uintptr_t)(UNIT - 1), a + size);
     pthread_mutex_unlock(&window_lock);
     return ok;
 }

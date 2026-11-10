@@ -1612,6 +1612,9 @@ int main(int argc, char **argv) {
             /* (every shader translated before the first play, where hookshot_shaders.bin is beside the game, without the
                driver's part: with it the 4,128 compute programs alone went at ~1.3 a second, hours in all; without, ~26) */
             {"RX_VK_NO_WARM", "1"},
+            /* (the recordings' 48 descriptor pools at an eighth: 4 MiB of the driver's memory each as they come, 195 MiB in
+               all, for the few programs past the push limit; one that runs out is followed by another) */
+            {"RX_VK_DESC_POOL_DIV", "8"},
         };
         for (size_t i = 0; i < sizeof defaults / sizeof *defaults; i++) setenv(defaults[i][0], defaults[i][1], 0);
     }
