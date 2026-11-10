@@ -348,13 +348,21 @@ void clear_tex(VkCommandBuffer cmd, NvnState& st, const nvn_p_clear_tex& p) {
             lv.set_layers = 1, lv.min_layer = (uint16_t)(s.layer + k), lv.nlayers = 1;
             const VkImageView view = texture_view(s.tex, p.tex, &lv, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Attachment);
             if (!view) continue;
+            // (an attachment view of a compressed image is a raw one, one texel a block: its area and the rect in blocks, as
+            // targets() sizes a pass over it)
+            const bool raw = s.tex->format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && s.tex->format <= VK_FORMAT_BC7_SRGB_BLOCK;
+            const uint32_t aw = raw ? (lw + 3) / 4 : lw, ah = raw ? (lh + 3) / 4 : lh;
+            const int32_t rx = raw ? s.x / 4 : s.x, ry = raw ? s.y / 4 : s.y;
+            const uint32_t rw = std::min<uint32_t>(raw ? (s.x + s.w + 3) / 4 - rx : s.w, aw - std::min<uint32_t>(aw, (uint32_t)rx));
+            const uint32_t rh = std::min<uint32_t>(raw ? (s.y + s.h + 3) / 4 - ry : s.h, ah - std::min<uint32_t>(ah, (uint32_t)ry));
+            if (!rw || !rh) continue;
             VkRenderingAttachmentInfo a{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
             a.imageView = view;
             a.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-            ri.renderArea = {{0, 0}, {lw, lh}};
+            ri.renderArea = {{0, 0}, {aw, ah}};
             ri.layerCount = 1;
             const bool color = s.tex->aspect & VK_IMAGE_ASPECT_COLOR_BIT;
             if (color) ri.colorAttachmentCount = 1, ri.pColorAttachments = &a;
@@ -365,7 +373,7 @@ void clear_tex(VkCommandBuffer cmd, NvnState& st, const nvn_p_clear_tex& p) {
             ca.aspectMask = s.tex->aspect;
             if (color) std::memcpy(&ca.clearValue.color, &p.c, sizeof ca.clearValue.color);
             else ca.clearValue.depthStencil = {p.c.f[0], p.c.u[0]};
-            const VkClearRect rect{{{s.x, s.y}, {s.w, s.h}}, 0, 1};
+            const VkClearRect rect{{{rx, ry}, {rw, rh}}, 0, 1};
             vkCmdClearAttachments(cmd, 1, &ca, 1, &rect);
             vkCmdEndRendering(cmd);
         }

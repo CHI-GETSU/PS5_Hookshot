@@ -3028,7 +3028,11 @@ Targets targets(NvnState& s) {
         at.color[i] = tex, at.color_view[i] = view, at.color_format[i] = f;
         const uint32_t level = image_level(tex, view_level(v));
         at.color_level[i] = level, at.color_layer[i] = v ? view_layer(v) : 0;
-        const uint32_t w = std::max(1u, tex->width >> level), h = std::max(1u, tex->height >> level);
+        uint32_t w = std::max(1u, tex->width >> level), h = std::max(1u, tex->height >> level);
+        // (a raw view of a compressed target is one texel a block: its extent in blocks. The texels' 64 x 64 over the 16 x 16
+        // view of OoT's noise volumes put the render area past the attachment)
+        const auto bc = [](VkFormat x) { return x >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && x <= VK_FORMAT_BC7_SRGB_BLOCK; };
+        if (bc(tex->format) && !bc(f)) w = (w + 3) / 4, h = (h + 3) / 4;
         at.width = at.width ? std::min(at.width, w) : w;
         at.height = at.height ? std::min(at.height, h) : h;
         at.samples = tex->samples;
@@ -5141,15 +5145,25 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         SKIP_HERE();
     }
     if (skip_live(cp->key)) return;   // (EvilOOT, RX_VK_SKIP_FILE)
-    {   // (hookshot, RX_VK_SKIP_PROG: draws too, their native code keys logged once; =-: none. By default OoT's 53509044401d78d2, 128
-        // draws of a full-screen pass over two 64^3 volumes, once, while the game loads: on about half the first starts the GPU stalled in
-        // them for Windows' two seconds and the device was lost, a black screen with the frame counter over it. Its shaders are straight-line
-        // sampling code and the cause is still open. It was taken off this list once after a few clean runs: it had not gone. 0 lost
-        // of 8 first starts without it, against 7 of 14 with it)
+    {   // (hookshot, RX_VK_SKIP_PROG=<key prefix,...>: draws too, their native code keys logged once; =-: none)
+        // (OoT's 53509044401d78d2, by default only while its targets have no view: 128 draws, once while an area loads, that render
+        // the slices of two 64^3 BC4 noise volumes through raw RGBA16UI views. Those views were not made (no attachment usage) and
+        // the pass ran over no target at the texels' 64 x 64: on about half the first starts the device was lost (7 of 14), and it
+        // was left out always. Left out, the volumes stayed zero and the foliage's LOD crossfade left trees bare at mid distance
+        // (#1151). Where the driver takes the usage (vk_texture.cpp) the views are made and the pass is sized in blocks
+        // (targets()); it runs there, and is still left out where they are not)
+        static const bool default_list = !getenv("RX_VK_SKIP_PROG");
+        if (default_list && cp->key == 0x53509044401d78d2ull && !at.n) {
+            static std::atomic<int> told{0};
+            if (told++ < 2)
+                logf("vk: draws of program %016llx left out: its targets have no view (RX_VK_SKIP_PROG=- runs them anyway)",
+                     (unsigned long long)cp->key);
+            return;
+        }
         // (the list parsed once into key prefixes: it was a snprintf and a string compare on every draw)
         static const std::vector<std::pair<uint64_t, uint64_t>> skip_keys = [] {   // (value, mask) of each prefix
             std::vector<std::pair<uint64_t, uint64_t>> v;
-            const char* list = !getenv("RX_VK_SKIP_PROG") ? "53509044401d78d2" : strcmp(getenv("RX_VK_SKIP_PROG"), "-") ? getenv("RX_VK_SKIP_PROG") : "";
+            const char* list = getenv("RX_VK_SKIP_PROG") && strcmp(getenv("RX_VK_SKIP_PROG"), "-") ? getenv("RX_VK_SKIP_PROG") : "";
             for (const char* q = list; *q;) {
                 const char* e = q;
                 while (*e && *e != ',') e++;
