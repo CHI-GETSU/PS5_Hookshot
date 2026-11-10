@@ -941,6 +941,35 @@ Targets note_targets(const PipeNote& n) {
 }
 void state_record(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, const uint8_t color_types[8]);
 uint64_t pipeline_key(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo);
+/// (note_mu held) the notes file opened for this run's new pipelines, the keys it holds noted. known: its notes as pipe_notes_read
+/// has just read them (precompile_run, before play; a note it left out as not sane is written again when its pipeline is met,
+/// and the next read takes that one). Without them the records are read here in order. The first new pipeline in play opened
+/// the file and read its keys back with a seek and an 8-byte read each: 142 ms for 1150 notes on the thread replaying
+void notes_open_locked(const std::vector<std::unique_ptr<PipeNote>>* known) {
+    static const uint64_t stamp = program_cache_stamp();
+    const std::string path = pipe_notes_path();
+    uint64_t head[2] = {0, 0};
+    if (FILE* f = fopen(path.c_str(), "rb")) {
+        if (fread(head, 8, 2, f) != 2) head[0] = 0;
+        fclose(f);
+    }
+    const bool same = head[0] == stamp && head[1] == sizeof(PipeNote);
+    if (same && known) {
+        for (const auto& n : *known) noted.insert(n->key);
+    } else if (same) {
+        if (FILE* f = fopen(path.c_str(), "rb")) {
+            auto rec = std::make_unique<PipeNote>();
+            if (_fseeki64(f, 16, SEEK_SET) == 0)
+                while (fread(rec.get(), sizeof(PipeNote), 1, f) == 1) noted.insert(rec->key);
+            fclose(f);
+        }
+    }
+    note_file = fopen(path.c_str(), same ? "ab" : "wb");
+    if (note_file && !same) {
+        const uint64_t h[2] = {stamp, sizeof(PipeNote)};
+        fwrite(h, 8, 2, note_file);
+    }
+}
 void pipeline_note(uint64_t key, const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo,
                    const uint8_t* color_types = nullptr) {
     static const bool off = getenv("RX_VK_NO_PROGRAM_CACHE") != nullptr;
@@ -952,32 +981,7 @@ void pipeline_note(uint64_t key, const Program& p, const NvnState& s, const Targ
     for (int i = 0; i < 8; i++) rec->color_format[i] = (uint32_t)at.color_format[i];
     rec->s = s;
     std::lock_guard lk(note_mu);
-    static const uint64_t stamp = program_cache_stamp();
-    if (!note_file) {
-        const std::string path = pipe_notes_path();
-        uint64_t head[2] = {0, 0};
-        if (FILE* f = fopen(path.c_str(), "rb")) {
-            if (fread(head, 8, 2, f) != 2) head[0] = 0;
-            fclose(f);
-        }
-        const bool same = head[0] == stamp && head[1] == sizeof(PipeNote);
-        if (same) {
-            if (FILE* f = fopen(path.c_str(), "rb")) {
-                for (int64_t at = 16;; at += sizeof(PipeNote)) {
-                    uint64_t k = 0;
-                    _fseeki64(f, at, SEEK_SET);
-                    if (fread(&k, 8, 1, f) != 1) break;
-                    noted.insert(k);
-                }
-                fclose(f);
-            }
-        }
-        note_file = fopen(path.c_str(), same ? "ab" : "wb");
-        if (note_file && !same) {
-            const uint64_t h[2] = {stamp, sizeof(PipeNote)};
-            fwrite(h, 8, 2, note_file);
-        }
-    }
+    if (!note_file) notes_open_locked(nullptr);
     if (note_file && noted.insert(key).second) fwrite(rec.get(), sizeof(PipeNote), 1, note_file), fflush(note_file);
 }
 
@@ -1040,6 +1044,21 @@ std::vector<StateRec> state_list_read(const std::string& path) {
 std::mutex state_mu;
 FILE* state_file = nullptr;
 std::unordered_set<uint64_t> state_seen;
+/// (state_mu held) the state list opened for this run's new pipelines, the records it holds hashed. precompile_run opens it before
+/// play: the first new pipeline in play read and hashed the whole list on the thread replaying, 8-18 ms
+void state_open_locked() {
+    const std::string path = state_list_path("hookshot_pipeline_states.bin");
+    const std::vector<StateRec> had = state_list_read(path);
+    for (const StateRec& o : had) state_seen.insert(state_hash(o));
+    FILE* probe = fopen(path.c_str(), "rb");
+    const bool keep = probe && !had.empty();
+    if (probe) fclose(probe);
+    state_file = fopen(path.c_str(), keep ? "ab" : "wb");
+    if (state_file && !keep) {
+        const uint32_t size = sizeof(StateRec);
+        fwrite(kStateMagic, 8, 1, state_file), fwrite(&size, 4, 1, state_file);
+    }
+}
 void state_record(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, const uint8_t color_types[8]) {
     static const bool off = getenv("RX_VK_NO_STATE_LIST") != nullptr;
     if (off) return;
@@ -1065,19 +1084,7 @@ void state_record(const Program& p, const NvnState& s, const Targets& at, VkPrim
     }
     const uint64_t h = state_hash(r);
     std::lock_guard lk(state_mu);
-    if (!state_file) {
-        const std::string path = state_list_path("hookshot_pipeline_states.bin");
-        const std::vector<StateRec> had = state_list_read(path);
-        for (const StateRec& o : had) state_seen.insert(state_hash(o));
-        FILE* probe = fopen(path.c_str(), "rb");
-        const bool keep = probe && !had.empty();
-        if (probe) fclose(probe);
-        state_file = fopen(path.c_str(), keep ? "ab" : "wb");
-        if (state_file && !keep) {
-            const uint32_t size = sizeof(StateRec);
-            fwrite(kStateMagic, 8, 1, state_file), fwrite(&size, 4, 1, state_file);
-        }
-    }
+    if (!state_file) state_open_locked();
     if (state_file && state_seen.insert(h).second) fwrite(&r, sizeof r, 1, state_file), fflush(state_file);
 }
 /// (prepare_run, the seed open) every pipeline of the state lists (the player's own and the shipped one): its program translated
@@ -6367,6 +6374,16 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     struct Done { const std::string& path; ~Done() { remove(path.c_str()); } } done_marker{running};
     pcache_init();
     std::vector<std::unique_ptr<PipeNote>> notes = pipe_notes_read();
+    // (the notes file and the state list opened now, before play, with the notes just read: pipeline_note and state_record opened
+    // them at the first new pipeline in play, on the thread replaying, 150 ms and more)
+    if (!getenv("RX_VK_NO_PROGRAM_CACHE")) {
+        std::lock_guard lk(note_mu);
+        if (!note_file) notes_open_locked(&notes);
+    }
+    if (!getenv("RX_VK_NO_STATE_LIST")) {
+        std::lock_guard lk(state_mu);
+        if (!state_file) state_open_locked();
+    }
     std::unordered_set<uint64_t> wanted;
     for (const auto& n : notes) wanted.insert(n->prog);
     std::vector<Program*> computes;
