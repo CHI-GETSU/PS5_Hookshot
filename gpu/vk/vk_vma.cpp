@@ -105,7 +105,20 @@ VmaPool images_pool() {
     return image_pool;
 }
 
+#ifdef __PROSPERO__
+extern "C" uint64_t hos_ps5_direct_room(void);   // (host/ps5/win32_ps5.c: the title's free direct memory in all)
+uint64_t ps5_tex_reserve();                      // (vk_texture.cpp: what is kept free for the game)
+#endif
 bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target) {
+#ifdef __PROSPERO__
+    // (PS5, memory short: an image of about 1 MB and up gets memory of its own, which goes back to the console's pool the
+    // moment the image does. In Hyrule Field 466 MB was free inside the blocks (640 MB of them for 382 MB of images, 416 for
+    // 208 MB of render targets) while the game's next page found none; smaller images stay in the blocks, a memory object
+    // each would be thousands)
+    if (!dedicated && (uint64_t)ci.extent.width * ci.extent.height * ci.extent.depth * ci.arrayLayers >= (256u << 10) &&
+        hos_ps5_direct_room() < ps5_tex_reserve())
+        dedicated = true;
+#endif
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     // (in VRAM or not at all: an image VMA puts in system memory when VRAM is full is read over PCIe every frame,

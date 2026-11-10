@@ -64,6 +64,7 @@ void hos_ps5_klog_now(const char *fmt, ...) {
 /* ---- the guest window ---------------------------------------------------------------------------------------- */
 enum { U_RESERVED = 0, U_COMMITTED = 1 };
 static uint8_t *unit_state;                   /* GUEST_UNITS bytes, made with the reservation */
+static uint8_t *unit_ahead;                   /* (HOS_PS5_ZERO_SCAN) 1: backed by hos_ps5_commit_now, not by a touch */
 static int64_t *unit_phys;                    /* a committed unit's direct memory (for its decommit) */
 static int64_t *free_units;                   /* direct memory of decommitted units, taken first by the next commits */
 static size_t free_count, free_cap;
@@ -310,6 +311,9 @@ int hos_ps5_commit_now(void *addr, size_t size) {
     const uintptr_t a = (uintptr_t)addr;
     if (!size || !in_window(a, a + size)) return 1;
     pthread_mutex_lock(&window_lock);
+    if (window_reserved && unit_ahead)   /* (HOS_PS5_ZERO_SCAN: the units backed here before the game touched them) */
+        for (uint64_t u = (a - HOS_PS5_GUEST_LO) / UNIT; u < (a + size - HOS_PS5_GUEST_LO + UNIT - 1) / UNIT; u++)
+            if (unit_state[u] != U_COMMITTED) unit_ahead[u] = 1;
     const int ok = window_reserved && commit_units_wait(a & ~(uintptr_t)(UNIT - 1), a + size);
     pthread_mutex_unlock(&window_lock);
     return ok;
@@ -1156,10 +1160,43 @@ uint64_t hos_ps5_direct_room(void) {
     return __atomic_load_n(&room, __ATOMIC_RELAXED);
 }
 
+/* HOS_PS5_ZERO_SCAN=1: how much of the game's backed memory holds nothing but zeros, by 64 KiB unit (pages it never wrote, or
+   cleared: what a first-touch commit would not have backed). Read 64 MiB at a time under the window's lock, so no unit goes
+   away under the read; units the game has made unreadable are left out */
+static uint64_t zero_units_now(uint64_t *ahead) {
+    uint64_t zero = 0;
+    *ahead = 0;
+    for (uint64_t u = 0; u < GUEST_UNITS; u += 1024) {
+        pthread_mutex_lock(&window_lock);
+        for (uint64_t k = u; k < u + 1024 && k < GUEST_UNITS; k++) {
+            if (unit_state[k] != U_COMMITTED) continue;
+            void *at = (void *)(HOS_PS5_GUEST_LO + k * UNIT), *start = NULL, *end = NULL;
+            uint32_t prot = 0;
+            if (sceKernelQueryMemoryProtection(at, &start, &end, &prot) != 0 || !(prot & PS5_KERNEL_PROT_CPU_READ) ||
+                (uintptr_t)end < (uintptr_t)at + UNIT)
+                continue;
+            const uint64_t *p = at;
+            size_t i = 0;
+            while (i < UNIT / 8 && !p[i]) i++;
+            zero += i == UNIT / 8;
+            if (i == UNIT / 8 && unit_ahead && unit_ahead[k]) (*ahead)++;
+        }
+        pthread_mutex_unlock(&window_lock);
+    }
+    *ahead *= UNIT;
+    return zero * UNIT;
+}
+
 /* ---- HOS_PS5_CPU=1: the whole process's CPU use every 5 s (every thread, the ones the sampler cannot see too) ---- */
 #include <sys/resource.h>
 static void *cpu_meter(void *unused) {
     (void)unused;
+    if (getenv("HOS_PS5_ZERO_SCAN")) {
+        uint8_t *marks = calloc(GUEST_UNITS, 1);
+        pthread_mutex_lock(&window_lock);
+        unit_ahead = marks;
+        pthread_mutex_unlock(&window_lock);
+    }
     struct rusage before;
     getrusage(RUSAGE_SELF, &before);
     double t0 = now_ms();
@@ -1182,6 +1219,14 @@ static void *cpu_meter(void *unused) {
             pthread_mutex_lock(&window_lock);
             const uint64_t kept = (uint64_t)free_count * UNIT, ahead = (uint64_t)(block_end - block_next);
             pthread_mutex_unlock(&window_lock);
+            if (getenv("HOS_PS5_ZERO_SCAN")) {
+                const double z0 = now_ms();
+                uint64_t ahead = 0;
+                const uint64_t zero = zero_units_now(&ahead);
+                fprintf(stderr, "[ps5] guest pages: %llu MiB of %llu backed hold only zeros, %llu MiB of those backed for the "
+                        "GPU or a file read before the game touched them (read in %.0f ms)\n", (unsigned long long)(zero >> 20),
+                        (unsigned long long)(committed_bytes >> 20), (unsigned long long)(ahead >> 20), now_ms() - z0);
+            }
             extern uint64_t radv_ps5_allocated_bytes;   /* (the driver's buffers, all of them: its winsys counts them) */
             fprintf(stderr, "[ps5] direct memory: %llu MiB taken, %llu free in %llu pieces; the driver's buffers %llu MiB; the guest "
                     "window keeps %llu MiB of decommitted units and %llu MiB of its block unused\n",

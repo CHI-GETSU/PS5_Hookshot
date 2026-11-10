@@ -86,9 +86,12 @@ together.
       mapped after a start that compiles every pipeline, where it stayed at 3.4 with 0.7 in use). Images come from 32 MB
       blocks and the recordings' descriptor pools are an eighth of upstream's (`RX_VK_DESC_POOL_DIV=8`): the town's lowest
       free memory went from 558 to 911 MiB at the same frame rate. With less than 1 GB free every texture unused for a
-      second goes, and a game page that finds no memory waits up to 10 s for some to come back. Still open: a save that
-      holds 8.3 GB of game pages in the town ran out leaving it, at 8.8 GB, with the first of these changes; the mesh
-      shaders' scratch ring (320 MiB) and textures other than ASTC are not yet made smaller for it
+      second goes, an image of 1 MB and up gets memory of its own, and a game page that finds no memory waits up to
+      10 s for some to come back. A save that holds 8.3 GB of game pages in the town now leaves it for Hyrule Field,
+      and ran out there a minute later with 9.2 GB of game pages (before the images' own memory). `HOS_PS5_ZERO_SCAN=1`
+      counts the game's backed 64 KiB units that hold only zeros: ~800 MiB of 7.5 GB in the town, 430 MiB of them
+      backed for the GPU's imports before the game wrote them. Still open: the mesh shaders' scratch ring (320 MiB),
+      the heap's 950 MiB in use, and textures other than ASTC are not yet made smaller for it
 
 Local `main` is upstream's `main` of 2026-11-10 (2877284, past v2.0.14's line) with PR #1438 (AMD resolve keys, image fallback past VMA's budget) and RufflezAU's
 Steam Deck texture eviction by age in milliseconds (`RX_VK_EVICT_MIN_MS`, 1000; read once a present here, not at each touch).
