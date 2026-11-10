@@ -80,6 +80,7 @@ struct Texture {
     uint64_t owned_frame = 0; // (the present its storage was last noted as render targets' (gpu_owned))
     uint32_t key_layout = 0, key_cls = 0;   // (the key's storage layout and format class)
     bool vw_listed = false;   // (in the list of GPU-written textures of virtual pools: texture_flush_to_guest)
+    uint64_t pool_key = 0;    // (a render target's image: its create info's key in the pool it goes to when the texture does)
     std::unordered_map<uint64_t, VkImageView> views;
 };
 
