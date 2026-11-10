@@ -50,21 +50,25 @@ link() {
     --as-needed "$sdk"/target/lib/*.so
 }
 link
-# A C++ thread_local declared extern leaves a weak reference to its initialiser (_ZTH...), which stays undefined when the
-# variable needs none; a loader reads it as null, but the native tool takes every undefined symbol for an import. They
-# are bound to 0 here, which is what they read as anyway.
-zth=$("$sdk/bin/llvm-nm" "$work/link/llvm-pie.elf" | awk '$1 == "w" && $2 ~ /^_ZTH/ { print "--defsym=" $2 "=0" }')
-# shellcheck disable=SC2086
-[[ -z $zth ]] || link $zth
+# What the modules a title loads export: the SDK's stubs but libkernel_sys's and libScePosixForWebKit's, and AGC's.
+for library in "$sdk"/target/lib/*.so "$work/link/stubs/libSceAgc.so" "$work/link/stubs/libSceAgcDriver.so"; do
+    case ${library##*/} in libkernel_sys.so | libScePosixForWebKit.so) continue ;; esac
+    "$sdk/bin/llvm-nm" -D --defined-only "$library" 2>/dev/null | awk '{ print $NF }'
+done | sort -u > "$work/link/exported.txt"
+# A weak reference nothing defines reads as null: the entry points RADV leaves to Mesa's common code (some 5,700), and
+# the initialiser of a C++ thread_local that needs none (_ZTH...). lld 18 keeps them all in the dynamic table and later
+# ones a few, and the native tool takes every undefined symbol there for an import. They are bound to 0 here, which is
+# what they read as anyway.
+"$sdk/bin/llvm-nm" -D --undefined-only "$work/link/llvm-pie.elf" |
+    awk '$1 == "w" || $1 == "v" { sub(/@.*/, "", $2); print $2 }' | sort -u |
+    comm -23 - "$work/link/exported.txt" | sed 's/.*/--defsym=&=0/' > "$work/link/weak.rsp"
+[[ ! -s $work/link/weak.rsp ]] || link @"$work/link/weak.rsp"
 echo "linked: $(( $(stat -c %s "$work/link/llvm-pie.elf") >> 20 )) MB ($(( SECONDS - start )) s)"
 # A title loads neither libkernel_sys's exports nor libScePosixForWebKit's: an import only their stubs define links,
 # and is null at run time (its first call jumps to address 0). Refuse it here, not on the console.
 null_imports=$(comm -23 \
     <("$sdk/bin/llvm-nm" -D --undefined-only "$work/link/llvm-pie.elf" | awk '$1 == "U" { sub(/@.*/, "", $2); print $2 }' | sort -u) \
-    <(for library in "$sdk"/target/lib/*.so "$work/link/stubs/libSceAgc.so" "$work/link/stubs/libSceAgcDriver.so"; do
-        case ${library##*/} in libkernel_sys.so | libScePosixForWebKit.so) continue ;; esac
-        "$sdk/bin/llvm-nm" -D --defined-only "$library" 2>/dev/null | awk '{ print $NF }'
-    done | sort -u))
+    "$work/link/exported.txt")
 if [[ -n $null_imports ]]; then
     echo "link.sh: imports that no module a title loads exports (null at run time): ${null_imports//$'\n'/ }" >&2
     exit 1

@@ -14,8 +14,11 @@ sdk=${PS5_PAYLOAD_SDK:-$root/../PS5_VulkanTemplate/.deps/native/ps5-payload-sdk}
 export PS5_PAYLOAD_SDK="$sdk" PS5_CLANG=${PS5_CLANG:-$(command -v clang)}
 mkdir -p "$deps/downloads"
 archive="$deps/downloads/zstd-$ZSTD_VER.tar.gz"
-[[ -f $archive ]] || curl -fL --retry 3 --proto '=https' -o "$archive" \
-    "https://github.com/facebook/zstd/releases/download/v$ZSTD_VER/zstd-$ZSTD_VER.tar.gz"
+if [[ ! -f $archive ]]; then   # (whole or not at all: a download that stopped is not taken for the archive)
+    curl -fL --retry 5 --retry-all-errors --proto '=https' -o "$archive.part" \
+        "https://github.com/facebook/zstd/releases/download/v$ZSTD_VER/zstd-$ZSTD_VER.tar.gz"
+    mv "$archive.part" "$archive"
+fi
 build="$deps/build-zstd"
 rm -rf -- "$build" && mkdir -p "$build"
 tar -xzf "$archive" -C "$build" --strip-components=1

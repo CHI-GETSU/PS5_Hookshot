@@ -21,7 +21,7 @@ rm -rf -- "$build"
 mkdir -p "$build" "$deps/downloads"
 
 fetch() {   # url file
-    [[ -f $deps/downloads/$2 ]] || curl -fL --retry 3 --proto '=https' -o "$deps/downloads/$2.part" "$1"
+    [[ -f $deps/downloads/$2 ]] || curl -fL --retry 5 --retry-all-errors --proto '=https' -o "$deps/downloads/$2.part" "$1"
     [[ -f $deps/downloads/$2.part ]] && mv "$deps/downloads/$2.part" "$deps/downloads/$2"
     return 0
 }
@@ -73,6 +73,7 @@ EOF
     --enable-cross-compile --target-os=freebsd --arch=x86_64 --cpu=znver2 \
     --cc="$sdk/bin/prospero-clang" --cxx="$sdk/bin/prospero-clang++" --ar="$sdk/bin/prospero-ar" \
     --ranlib="$sdk/bin/prospero-ranlib" --nm="$sdk/bin/prospero-nm" --x86asmexe="$nasm" \
+    --host-cc="$PS5_CLANG" \
     --pkg-config=pkg-config --pkg-config-flags=--static \
     --enable-static --disable-shared --enable-pic --disable-programs --disable-doc --disable-debug \
     --disable-autodetect --disable-avdevice --disable-avfilter --disable-avformat --disable-swresample \

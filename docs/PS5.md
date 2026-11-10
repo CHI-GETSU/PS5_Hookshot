@@ -20,8 +20,19 @@ as a native PS5 title, **PPSA99024**, on my homebrew stack: Mesa's RADV from
 | Link | One executable with RADV linked in, signed as the console's fake SELF | `ps5/tools/link.sh` (PS5_VulkanTemplate's link) |
 | Install | `dist/PPSA99024` to `/data/homebrew/PPSA99024`; `romfs/` is read in place from your `.nup` on the console (`HOS_PS5_NUP`, default `/data/prosperoeden/roms/oot/oot.nup`) | FTP, `host/ps5/nup_romfs.c` |
 
+One command does all of it on a Linux PC, from a fresh checkout, and on Windows through Ubuntu under WSL 2
+(`ps5/build-windows.bat`, which runs it there):
+
+```sh
+ps5/build-title.sh <your game.nup>      # --help says the rest; sudo ps5/build-title.sh --install-packages on Ubuntu
+```
+
+It clones PS5_Vulkan, PS5_Mesa, PS5_PayloadSDK and PS5_MihawkGen beside this repository at the revisions the build was
+played with, builds RADV and the SDK once, and leaves `dist/PPSA99024`. By hand, with those in place, the steps are:
+
 ```sh
 python3 -I nx2/nup.py <your game.nup> --only exefs --extract work/game
+mkdir -p work/lift/image
 OOT_WORK=$PWD/work/lift python3 -I nx2/lift.py --standalone --write --exefs $PWD/work/game/exefs --work $PWD/work/lift
 ps5/tools/build-ffmpeg.sh
 python3 -I ps5/build.py

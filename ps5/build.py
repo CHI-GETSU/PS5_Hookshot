@@ -193,7 +193,7 @@ def main():
                        (os.path.join(VULKAN, "tools", "radv-link.sh"), "PS5_Vulkan (PS5_VULKAN)"),
                        (os.path.join(FFMPEG, "include", "libavcodec", "avcodec.h"), "FFmpeg (ps5/tools/build-ffmpeg.sh)"),
                        (os.path.join(DEPS, "zstd", "lib", "libzstd.a"), "zstd (ps5/tools/build-zstd.sh)"),
-                       (pkg("vulkanheaders", "v1.4.345"), "the Vulkan headers (ps5/tools/fetch-headers.sh)")):
+                       (pkg("vulkanheaders", "v1.4.345"), "the Vulkan headers (ps5/build-title.sh fetches them)")):
         if not os.path.exists(need):
             sys.exit("ps5/build.py: missing %s: %s" % (what, need))
     os.makedirs(os.path.join(OUT, "obj"), exist_ok=True)
