@@ -80,7 +80,9 @@ together.
 - [ ] Frame rate in play: 33-40 fps in Kokiri Forest where the PC build is GPU-bound at 60 (shown at twice that with frame
       generation)
 - [ ] A scene's first frames: 0.3-0.6 s, 3 s where its shaders are met for the first time
-- [ ] Out of memory after a while under load (0.4-1.1 GB of 13.2 free in Kokiri Forest)
+- [ ] Memory: Hyrule Castle Town ran out on arrival with textures of up to 1024 texels (two runs of three); the console's
+      default is 512 (`RX_VK_TEX_MAX_DIM`), where the town plays with 180-500 MiB of 13.2 GB free and a few shaders still
+      fail to translate for want of memory
 
 Local `main` is upstream's `main` of 2026-11-10 (2877284, past v2.0.14's line) with PR #1438 (AMD resolve keys, image fallback past VMA's budget) and RufflezAU's
 Steam Deck texture eviction by age in milliseconds (`RX_VK_EVICT_MIN_MS`, 1000; read once a present here, not at each touch).

@@ -8,7 +8,7 @@ cd "$(dirname "$0")/../.."
 name=$1 seconds=$2
 shift 2
 python3 ps5/tools/save.py restore > /dev/null 2>&1 || true   # (the autosave in Link's house: work/save-backup)
-A_COUNT=8 AFTER="45:LDOWN/2500,50:A" SHOTS_AT=6 ps5/tools/to-kokiri.sh "$name" "$seconds" HOS_HANDHELD=1 RX_VK_TEX_MAX_DIM=1024 RX_VK_TEX_SKIP_MB=16 \
+A_COUNT=8 AFTER="45:LDOWN/2500,50:A" SHOTS_AT=6 ps5/tools/to-kokiri.sh "$name" "$seconds" HOS_HANDHELD=1 RX_VK_TEX_MAX_DIM=512 RX_VK_TEX_SKIP_MB=16 \
     RX_VK_ASTC_BC_ALL=1 RX_VK_ASTC_BC_MB=0 RX_VK_SHOT_EVERY=1 RX_VK_FLASH=1 RX_VK_FLASH_DUMPS=0 RX_VK_SLOW_LOG=300 "$@" > /dev/null 2>&1
 log=work/runs/$name.log
 echo "$name: $(tail -1 "work/runs/$name.out" | cut -c1-60)"

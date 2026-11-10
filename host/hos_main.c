@@ -1599,12 +1599,14 @@ int main(int argc, char **argv) {
     load_hookshot_env();
 #ifdef __PROSPERO__
     {   /* (PS5) What the console plays with, unless hookshot_env.txt says otherwise. The game's memory, the renderer's and the
-           program share 13.2 GB: the handheld profile, textures of at most 1024 texels, the largest left out and every ASTC one
-           kept as BC3 leave ~1 GB free in Kokiri Forest. The game runs at 26-40 fps there on these cores with the GPU half idle:
+           program share 13.2 GB: the handheld profile, textures of at most 512 texels, the largest left out and every ASTC one
+           kept as BC3. At 1024 texels Kokiri Forest had ~1 GB free but Hyrule Castle Town ran out on arrival (std::bad_alloc
+           with 32 MiB left, two runs of three ending there); at 512 the town has 180-500 MiB free and plays. The game runs
+           at 26-40 fps in the forest on these cores with the GPU half idle:
            PS5_MihawkGen's network makes every other frame, shown on an even line (65 fps out of 33); FSR 3.1's frame
            interpolation is off (RX_VK_FSR_FG=1 puts it back where RX_VK_MIHAWKGEN=0 leaves the frame to it). */
         static const char *const defaults[][2] = {
-            {"HOS_HANDHELD", "1"}, {"RX_VK_TEX_MAX_DIM", "1024"}, {"RX_VK_TEX_SKIP_MB", "16"}, {"RX_VK_ASTC_BC_ALL", "1"},
+            {"HOS_HANDHELD", "1"}, {"RX_VK_TEX_MAX_DIM", "512"}, {"RX_VK_TEX_SKIP_MB", "16"}, {"RX_VK_ASTC_BC_ALL", "1"},
             {"RX_VK_ASTC_BC_MB", "0"}, {"RX_VK_FRAMEGEN_MULT", "2"}, {"RX_VK_PACE", "1"},
             {"RX_VK_FSR_FG", "0"},
             /* (every shader translated before the first play, where hookshot_shaders.bin is beside the game, without the
