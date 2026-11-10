@@ -72,7 +72,8 @@ if [[ ! -f $here/build.py || ! -f $here/../nx2/lift.py ]]; then
     if [[ ! -d $home/PS5_Hookshot/.git ]]; then
         git -c advice.detachedHead=false clone -q --branch "$REF" https://github.com/mihawk-99/PS5_Hookshot.git "$home/PS5_Hookshot"
     else
-        git -C "$home/PS5_Hookshot" fetch -q --tags origin
+        # (--force: the fork's CI moves its linux-parts tag on every push, and a moved tag stops a plain fetch)
+        git -C "$home/PS5_Hookshot" fetch -q --force --tags origin
         git -C "$home/PS5_Hookshot" checkout -q "$REF" ||
             die "$home/PS5_Hookshot has changes of its own: build it with its own ps5/build-title.sh"
     fi
