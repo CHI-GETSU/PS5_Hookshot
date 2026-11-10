@@ -11,6 +11,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <new>
 #include <thread>
 #include <vector>
 
@@ -1030,10 +1031,40 @@ __declspec(dllexport)
 #else
 __attribute__((visibility("default")))
 #endif
+#ifdef __PROSPERO__
+// (PS5) operator new with no memory waits for some, as a game page does (host/ps5/win32_ps5.c commit_units_wait): the game's
+// pages, the heap and the renderer share one pool, and a burst of the game's takes the last of it for a moment. A
+// std::bad_alloc nothing caught, in capture_make on the game's submit thread, ended the title in Hyrule Castle Town with
+// 150-300 MiB free seconds before. After 10 s of one wait the allocation throws as before
+extern "C" int sceKernelUsleep(unsigned microseconds);
+extern "C" void hos_ps5_klog_now(const char* fmt, ...);
+extern "C" void ps5_heap_trim(void) __attribute__((weak));   // (PS5_PayloadSDK 55a2de0 and later)
+static void ps5_new_waits() {
+    using clk = std::chrono::steady_clock;
+    static thread_local clk::time_point first, last;
+    const auto now = clk::now();
+    if (now - last > std::chrono::milliseconds(200)) {   // (a new wait: the last one ended, with memory or with a throw)
+        first = now;
+        static std::atomic<int> told{0};
+        if (told++ < 20) hos_ps5_klog_now("[ps5] operator new: no memory: waiting for some");
+        if (ps5_heap_trim) ps5_heap_trim();
+    }
+    if (now - first > std::chrono::seconds(10)) {
+        last = {};
+        throw std::bad_alloc();
+    }
+    sceKernelUsleep(20000);
+    last = clk::now();
+}
+#endif
+
 const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
     using namespace mkwvk;
     if (!h || h->version != MKWVK_API_VERSION) return nullptr;
     host = h;
+#ifdef __PROSPERO__
+    std::set_new_handler(ps5_new_waits);
+#endif
     if (!load_global()) {
         logf("vk: vulkan-1.dll not found");
         return nullptr;
