@@ -210,12 +210,27 @@ void WakeByAddressAll(void *addr);
 
 /* ---- time ---- */
 static inline BOOL QueryPerformanceFrequency(LARGE_INTEGER *f) { f->QuadPart = 1000000000LL; return TRUE; }
+#ifdef __PROSPERO__
+/* (PS5) clock_gettime is a call into the system there, and the clock is read very often: the replay at every counter
+   report, the game through GetSystemTick (10% of one core in Hyrule Castle Town, most of it inside the replay, which
+   every submitting thread waits for). The processor's time stamp counter instead, in nanoseconds from CLOCK_MONOTONIC's
+   value when it was first read (host/ps5/win32_ps5.c). */
+extern uint64_t hos_ps5_tsc0, hos_ps5_tsc_mult;
+extern int64_t hos_ps5_ns0;
+void hos_ps5_clock_init(void);
+static inline BOOL QueryPerformanceCounter(LARGE_INTEGER *c) {
+    if (!hos_ps5_tsc_mult) hos_ps5_clock_init();
+    c->QuadPart = hos_ps5_ns0 + (int64_t)(((unsigned __int128)(__builtin_ia32_rdtsc() - hos_ps5_tsc0) * hos_ps5_tsc_mult) >> 32);
+    return TRUE;
+}
+#else
 static inline BOOL QueryPerformanceCounter(LARGE_INTEGER *c) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     c->QuadPart = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
     return TRUE;
 }
+#endif
 static inline ULONGLONG GetTickCount64(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);

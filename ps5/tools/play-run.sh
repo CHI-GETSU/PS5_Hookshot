@@ -10,7 +10,9 @@ for kv in "$@"; do extra+=(--env "$kv"); done
 # (the presses by the clock, in the game's own memory: a file of them, read 30 times a second from the title's folder, waits
 # with every other file there whenever a large one is replaced, and the game with it. The title screen is up ~40 s in; the
 # autosave is of Link outside his house)
-python3 ps5/tools/run.py "$name" --deploy --seconds "$seconds" --env RX_VK_SLOW_LOG=100 --env HOS_PS5_CPU=1 \
+# (SLOW=<ms>: the frames over that long are logged, RX_VK_SLOW_LOG. Not by default: it times every scope of the replay, which
+# a player's run does not, and the clock reads and thread-local lookups of that were ~5% of the frame rate in Hyrule Castle Town)
+python3 ps5/tools/run.py "$name" --deploy --seconds "$seconds" ${SLOW:+--env "RX_VK_SLOW_LOG=$SLOW"} --env HOS_PS5_CPU=1 \
     --env "HOS_INPUT_SCRIPT=${INPUT:-45:A,55:A,59:A,63:A,67:A,71:A,75:A,79:A}" "${extra[@]}" > "work/runs/$name.out" 2>&1
 log=work/runs/$name.log
 echo "$name: $(tail -1 "work/runs/$name.out" | cut -c1-60)"

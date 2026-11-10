@@ -712,6 +712,30 @@ static void *file_probe_open(void *unused) {
     }
     return NULL;
 }
+/* QueryPerformanceCounter's clock (host/posix/windows.h): the time stamp counter's rate as the system gives it, or
+   measured against CLOCK_MONOTONIC over 20 ms where it gives none; set before main, and at the first read otherwise. */
+uint64_t hos_ps5_tsc0, hos_ps5_tsc_mult;
+int64_t hos_ps5_ns0;
+__attribute__((constructor)) void hos_ps5_clock_init(void) {
+    uint64_t sceKernelGetTscFrequency(void);
+    if (hos_ps5_tsc_mult) return;
+    struct timespec t;
+    uint64_t hz = sceKernelGetTscFrequency();
+    if (hz < 100000000ull) {
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        const int64_t a = (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec;
+        const uint64_t ta = __builtin_ia32_rdtsc();
+        usleep(20000);
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        hz = (uint64_t)((__builtin_ia32_rdtsc() - ta) * 1e9 / (double)((int64_t)t.tv_sec * 1000000000LL + t.tv_nsec - a));
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    hos_ps5_tsc0 = __builtin_ia32_rdtsc();
+    hos_ps5_ns0 = (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec;
+    __atomic_store_n(&hos_ps5_tsc_mult, (uint64_t)(((unsigned __int128)1000000000ull << 32) / hz), __ATOMIC_RELEASE);
+    fprintf(stderr, "[ps5] clock: the time stamp counter at %llu Hz\n", (unsigned long long)hz);
+}
+
 /* The game's package on the console: HOS_PS5_NUP, else the copy an emulator there already keeps, so one 25 GB file serves
    both: PS5_Lichii's folder, then the one it had before 2026-11-10 (when neither is there, the first, for the message). */
 const char *hos_ps5_nup(void) {
