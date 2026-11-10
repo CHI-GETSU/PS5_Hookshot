@@ -22,7 +22,7 @@
 # --out DIR: also copy the finished title folder into DIR.
 set -euo pipefail
 
-REF=${HOOKSHOT_REF:-ps5-v0.1.0-beta.1}
+REF=${HOOKSHOT_REF:-ps5-v0.1.0-beta.2}
 VULKAN_REV=7f492b4c6f67a4e8c8c67a4272cfeef22abea9cc
 MESA_REV=0f86253f674c425052948eb3cb116c81e646a734
 SDK_REV=55a2de04e3364f0a6c8d6c337dc95436cf091ef0
@@ -131,7 +131,14 @@ project() {   # name revision [clone options]
     local name=$1 revision=$2 path="$parent/$1"
     shift 2
     if [[ -d $path/.git ]]; then
-        note "$name: there already, used as it is ($(git -C "$path" rev-parse --short HEAD))"
+        # (a folder an earlier release's script made: what this one pins is fetched, and a checkout of its own, detached
+        # and unchanged, moves to it. One on a branch, or with changes, is someone's own: used as it is)
+        git -C "$path" cat-file -e "$revision^{commit}" 2> /dev/null || { note "$name: fetching ${revision:0:11}"; git -C "$path" fetch -q origin || true; }
+        if [[ " $* " != *" --no-checkout "* ]] && ! git -C "$path" symbolic-ref -q HEAD > /dev/null &&
+            [[ -z $(git -C "$path" status --porcelain --untracked-files=no) && $(git -C "$path" rev-parse HEAD) != "$revision"* ]]; then
+            git -C "$path" checkout -q --detach "$revision" 2> /dev/null && note "$name: moved to ${revision:0:11}"
+        fi
+        note "$name: there already ($(git -C "$path" rev-parse --short HEAD))"
     else
         note "$name: cloning"
         git clone -q "$@" "https://github.com/mihawk-99/$name.git" "$path"
