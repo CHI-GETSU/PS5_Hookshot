@@ -40,6 +40,39 @@ bool image_pool_tried = false;
 // would halve, at twice the memory objects: the driver allows ~4096, the imported pools take ~2400)
 const uint64_t kImageBlock = (getenv("RX_VK_IMAGE_BLOCK_MB") ? (uint64_t)std::max(16, atoi(getenv("RX_VK_IMAGE_BLOCK_MB"))) : 128u) << 20;
 
+// (hookshot) and the render targets' images in blocks of their own (texture_get's for a target: OoT's transient ones, made and let go
+// all the time). In the same blocks as the textures that stay, each one gone left a hole beside a texture that kept its block: the
+// pool's 47-54 blocks (6-6.9 GB) held 1.9-3.6 GB of images in Kokiri Forest, VRAM sat at 93-98% of what the driver allows, and an
+// image made there then took 30-70 ms (RTX 5070). RX_VK_TARGET_BLOCKS=0: in the textures' blocks, as before
+VmaPool target_image_pool = VK_NULL_HANDLE;
+bool target_pool_tried = false;
+VmaPool images_pool();
+VmaPool target_images_pool() {
+    if (target_pool_tried) return target_image_pool;
+    target_pool_tried = true;
+    static const bool off = getenv("RX_VK_TARGET_BLOCKS") && !atoi(getenv("RX_VK_TARGET_BLOCKS"));
+    if (off || !images_pool()) return VK_NULL_HANDLE;
+    VkImageCreateInfo rep{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};   // (the image pool's representative image: the same memory type)
+    rep.imageType = VK_IMAGE_TYPE_2D;
+    rep.format = VK_FORMAT_R8G8B8A8_UNORM;
+    rep.extent = {256, 256, 1};
+    rep.mipLevels = rep.arrayLayers = 1;
+    rep.samples = VK_SAMPLE_COUNT_1_BIT;
+    rep.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    VmaAllocationCreateInfo ai{};
+    ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    uint32_t type = 0;
+    if (vmaFindMemoryTypeIndexForImageInfo(vma, &rep, &ai, &type) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VmaPoolCreateInfo pi{};
+    pi.memoryTypeIndex = type;
+    pi.blockSize = kImageBlock;
+    if (vmaCreatePool(vma, &pi, &target_image_pool) != VK_SUCCESS) target_image_pool = VK_NULL_HANDLE;
+    logf("vk: render targets' images from blocks of their own (%llu MB, memory type %u)%s", (unsigned long long)(kImageBlock >> 20),
+         type, target_image_pool ? "" : ": not made");
+    return target_image_pool;
+}
+
 VmaPool images_pool() {
     if (image_pool_tried) return image_pool;
     image_pool_tried = true;
@@ -64,7 +97,7 @@ VmaPool images_pool() {
     return image_pool;
 }
 
-bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated) {
+bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target) {
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     // (in VRAM or not at all: an image VMA puts in system memory when VRAM is full is read over PCIe every frame,
@@ -77,7 +110,7 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
         if (vmaCreateImage(vma, &ci, &dai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
     }
     static const bool no_pool = getenv("RX_VK_NO_IMAGE_POOL") != nullptr;
-    if (VmaPool pool = no_pool ? VK_NULL_HANDLE : images_pool()) {
+    if (VmaPool pool = no_pool ? VK_NULL_HANDLE : target && target_images_pool() ? target_images_pool() : images_pool()) {
         VmaAllocationCreateInfo pai = ai;
         pai.pool = pool;
         pai.usage = VMA_MEMORY_USAGE_UNKNOWN;
@@ -156,6 +189,19 @@ bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
     return vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, nullptr) == VK_SUCCESS;
 }
 /// (every heap: what VMA has in blocks and allocations there, what the process uses of it, its budget; one line)
+/// The image pools: their blocks, the images in them, and the free ranges between them (every 600 presents, with the heaps)
+void vma_log_image_blocks() {
+    for (VmaPool pool : {image_pool, target_image_pool}) {
+        if (!pool) continue;
+        VmaDetailedStatistics d{};
+        vmaCalculatePoolStatistics(vma, pool, &d);
+        logf("vk: image blocks%s: %u blocks %llu MB, %u images %llu MB; %u free ranges, the largest %llu MB",
+             pool == target_image_pool ? " (render targets)" : "", d.statistics.blockCount,
+             (unsigned long long)(d.statistics.blockBytes >> 20), d.statistics.allocationCount,
+             (unsigned long long)(d.statistics.allocationBytes >> 20), d.unusedRangeCount,
+             (unsigned long long)(d.unusedRangeSizeMax >> 20));
+    }
+}
 void vma_log_heaps() {
     VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
     vmaGetHeapBudgets(vma, b);

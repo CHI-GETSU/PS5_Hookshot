@@ -42,18 +42,37 @@ class TargetImagePoolTests(unittest.TestCase):
     def test_only_uncompressed_render_targets_are_pooled_and_zero_turns_it_off(self):
         make = block(self.tex, "Texture* create(const Key& key")
         rule = make[make.index("const uint64_t pool_key ="):make.index("x.pool_key = pool_key;")]
-        for part in ("!x.sparse", "pool_cap()", "!is_bc(x.format)", "!is_astc(x.format)",
+        for part in ("as_target", "!x.sparse", "pool_cap()", "!is_bc(x.format)", "!is_astc(x.format)",
                      "VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT", "VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT"):
             self.assertIn(part, rule, part)
         cap = block(self.tex, "uint64_t pool_cap()")
         self.assertIn('getenv("RX_VK_TARGET_POOL_MB")', cap)
-        self.assertIn(": 1024", cap)
+        self.assertIn(": 256", cap)
         self.assertIn("uint64_t pool_key = 0;", self.hdr)
+
+    def test_a_texture_made_for_a_target_is_one_and_its_image_comes_from_the_targets_blocks(self):
+        get = block(self.tex, "Texture* texture_get(const nvn_tex* t, bool for_sampling)")
+        self.assertIn("create(k, t, fi.format, fi.astc, bw, bh, bpb, !for_sampling)", get)
+        make = block(self.tex, "Texture* create(const Key& key")
+        self.assertIn("create_image(ci, x.image, x.allocation, false, as_target && !is_bc(x.format) && !is_astc(x.format))", make)
+        vma = (ROOT / "gpu" / "vk" / "vk_vma.cpp").read_text(encoding="utf-8")
+        image = block(vma, "bool create_image(const VkImageCreateInfo& ci")
+        self.assertIn("target && target_images_pool() ? target_images_pool() : images_pool()", image)
+        pool = block(vma, "VmaPool target_images_pool()")
+        self.assertIn('getenv("RX_VK_TARGET_BLOCKS")', pool)
+        self.assertIn("pi.blockSize = kImageBlock;", pool)
+        self.assertIn("void vma_log_image_blocks()", vma)
+
+    def test_the_dead_targets_are_swept_every_ten_presents(self):
+        frame = block(self.tex, "void texture_frame(uint64_t completed)")
+        self.assertIn('getenv("RX_VK_DEAD_EVERY")', frame)
+        self.assertIn(": 10;", frame[frame.index('getenv("RX_VK_DEAD_EVERY")'):])
+        self.assertIn("frame_no % (dead_targets ? dead_every : 600)", frame)
 
     def test_a_pooled_image_is_taken_before_one_is_made_and_still_cleared_from_undefined(self):
         make = block(self.tex, "Texture* create(const Key& key")
         take = make.index("pool_take(pool_key, x.image, x.allocation, x.views)")
-        self.assertLess(take, make.index("!create_image(ci, x.image, x.allocation)"))
+        self.assertLess(take, make.index("!create_image(ci, x.image, x.allocation, false, as_target"))
         after = make[take:]
         self.assertIn("b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;", after)
         self.assertIn("vkCmdClearColorImage", after)
