@@ -1469,7 +1469,7 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
             // (issues 38, 43). Left out, the last pass becomes a linear upscale of the movie (upscale_stub in vk_draw.cpp): the same picture at 60
             // fps, a little softer. The gameplay TAAU network stays. RX_VK_NETWORK_KEEP=<key prefixes>, "all": every one runs
             if (t->program.info.uses_cooperative_matrix) {
-                static const std::string keep = getenv("RX_VK_NETWORK_KEEP") ? getenv("RX_VK_NETWORK_KEEP") : "fd029a317a9a4b94,9dc98871eb7fc101";   // (amd-fix: 9dc98871 resolves the dynamic-resolution scene to 2048x1152; left out, the 3D picture is black under the HUD)
+                static const std::string keep = getenv("RX_VK_NETWORK_KEEP") ? getenv("RX_VK_NETWORK_KEEP") : "fd029a317a9a4b94,9dc98871eb7fc101,0775215f8da720e6,19346f9c9299279e,f10782f9e58b6a7c";   // (amd-fix: resolve dynamic-resolution scenes to 2048x1152; left out, the 3D picture is black under the HUD)
                 char hex[24];
                 snprintf(hex, sizeof hex, "%016llx", (unsigned long long)p.key);
                 bool kept_one = keep == "all";

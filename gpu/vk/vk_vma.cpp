@@ -117,6 +117,13 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
         if (vmaCreateImage(vma, &ci, &pai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
     }
     if (vmaCreateImage(vma, &ci, &ai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
+    if (ai.flags & VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT) {
+        static std::atomic<int> told_budget{0};
+        if (told_budget++ < 10) logf("vk: image over budget, retrying without WITHIN_BUDGET");
+        VmaAllocationCreateInfo vai = ai;
+        vai.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        if (vmaCreateImage(vma, &ci, &vai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
+    }
     // (hookshot) VRAM is full (a 4 GB card at a high resolution, #96): an image left unmade is a black screen, so it goes
     // to system memory instead, slow but drawn
     if (getenv("RX_VK_IMAGES_VRAM_ONLY")) return false;
