@@ -100,9 +100,11 @@ static int64_t direct_take(uint64_t n, uint64_t *got) {
         uint64_t size = n > BLOCK ? (n + BLOCK - 1) & ~(BLOCK - 1) : BLOCK;
         if (size > (1ULL << 30)) size = 1ULL << 30;   /* (a large commit takes 1 GiB blocks, one after another) */
         int64_t at = 0;
+        /* (fragmented: smaller, down to one unit. In Hyrule Castle Town 842 MiB were free in 203 pieces, the largest
+           under a block: a commit of 37 MiB found "no direct memory left" and the game wrote to the page it did not get) */
         while (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, UNIT, DIRECT_TYPE, &at)) {
-            if (size == BLOCK) return -1;
-            size = size / 2 > BLOCK ? (size / 2 + BLOCK - 1) & ~(BLOCK - 1) : BLOCK;   /* (fragmented: smaller) */
+            if (size <= UNIT) return -1;
+            size = (size / 2 + UNIT - 1) & ~(UNIT - 1);
         }
         block_next = at, block_end = at + (int64_t)size;
     }
@@ -1090,6 +1092,35 @@ void hos_srw_release(SRWLOCK *l) {
     else hos_srw_unlock_shared(l);
 }
 
+/* The title's free direct memory in all, whatever its pieces' sizes: every allocated range walked (~240 of them in play). */
+static uint64_t direct_room_now(uint64_t *pieces) {
+    struct { int64_t start, end; int type; } q;
+    int sceKernelDirectMemoryQuery(int64_t offset, int flags, void *info, size_t size);
+    const int64_t total = (int64_t)sceKernelGetDirectMemorySize();
+    uint64_t held = 0, n = 0;
+    int64_t off = 0, last_end = 0;
+    while (off < total && sceKernelDirectMemoryQuery(off, 1, &q, sizeof q) == 0 && q.end > q.start) {
+        if (q.start > last_end) n++;
+        held += (uint64_t)(q.end - q.start), last_end = q.end, off = q.end;
+    }
+    if (last_end < total) n++;
+    if (pieces) *pieces = n;
+    return (uint64_t)total - held;
+}
+/* The same for the renderer, which asks at every texture it makes (gpu/vk/vk_texture.cpp): counted at most every 50 ms. */
+uint64_t hos_ps5_direct_room(void) {
+    static int64_t at;
+    static uint64_t room;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    const int64_t was = __atomic_load_n(&at, __ATOMIC_RELAXED);
+    if (!was || now.QuadPart - was > 50000000LL) {
+        __atomic_store_n(&room, direct_room_now(NULL), __ATOMIC_RELAXED);
+        __atomic_store_n(&at, now.QuadPart, __ATOMIC_RELAXED);
+    }
+    return __atomic_load_n(&room, __ATOMIC_RELAXED);
+}
+
 /* ---- HOS_PS5_CPU=1: the whole process's CPU use every 5 s (every thread, the ones the sampler cannot see too) ---- */
 #include <sys/resource.h>
 static void *cpu_meter(void *unused) {
@@ -1109,6 +1140,18 @@ static void *cpu_meter(void *unused) {
         sceKernelAvailableDirectMemorySize(0, sceKernelGetDirectMemorySize(), 0x10000, &at, &largest);
         struct ps5_heap_stats heap = {0};
         ps5_heap_stats(&heap);
+        {   /* (who holds the title's direct memory: what is taken, what is free in how many pieces, and what the guest window
+               keeps without using it (the units a decommit left, the rest of its current block)) */
+            uint64_t pieces = 0;
+            const uint64_t room = direct_room_now(&pieces), total = sceKernelGetDirectMemorySize();
+            pthread_mutex_lock(&window_lock);
+            const uint64_t kept = (uint64_t)free_count * UNIT, ahead = (uint64_t)(block_end - block_next);
+            pthread_mutex_unlock(&window_lock);
+            fprintf(stderr, "[ps5] direct memory: %llu MiB taken, %llu free in %llu pieces; the guest window keeps %llu MiB of "
+                    "decommitted units and %llu MiB of its block unused\n", (unsigned long long)((total - room) >> 20),
+                    (unsigned long long)(room >> 20), (unsigned long long)pieces, (unsigned long long)(kept >> 20),
+                    (unsigned long long)(ahead >> 20));
+        }
         fprintf(stderr, "[ps5] cpu: %.0f%% of one core (user %.0f%%, system %.0f%%) over %.1f s; guest pages %llu MiB; heap %llu MiB "
                 "(peak %llu); stacks %lld MiB in %lld; direct memory %lld MiB, largest free piece %llu MiB\n",
                 100 * (user + sys) / (t - t0), 100 * user / (t - t0), 100 * sys / (t - t0), (t - t0) / 1e3,

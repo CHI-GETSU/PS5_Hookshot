@@ -136,7 +136,12 @@ static int32_t pad_unopened = -1;
 static struct pad_player_state *
 pad_state(int player)
 {
-   if (!pad_service || player < 0 || player >= PAD_PLAYERS || pad_states[player].handle < 0)
+   /* (HOS_PS5_NO_PAD=1, a test run's: no controller is read, so only its input script plays. A press on the real one
+    * during a run took the game through the menus early and to another place, and the run measured something else) */
+   static int no_pad = -1;
+   if (no_pad < 0)
+      no_pad = getenv("HOS_PS5_NO_PAD") != NULL;
+   if (no_pad || !pad_service || player < 0 || player >= PAD_PLAYERS || pad_states[player].handle < 0)
       return NULL;
    return &pad_states[player];
 }

@@ -53,7 +53,23 @@
 #include "host_shaders/block_linear_unswizzle_2d_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
+#ifdef __PROSPERO__
+extern "C" uint64_t hos_ps5_direct_room(void);   // (host/ps5/win32_ps5.c: the title's free direct memory in all)
+#endif
+
 namespace mkwvk {
+#ifdef __PROSPERO__
+// (PS5) The game's memory, the renderer's and the textures share the title's 13.2 GB, and a request of the game's that fails
+// ends the title: it writes to the page it did not get (Hyrule Castle Town on arrival, twice in three runs, and after a while
+// of play). So the last HOS_PS5_TEX_RESERVE_MB of free memory (1024) are the game's: below that a decoded ASTC texture, the
+// renderer's largest kind and the only one a level may be left out of, is made at 128 texels at most (32 below half of it),
+// and evict_textures makes it again at its own size once more than the reserve and a quarter is free.
+static uint64_t ps5_tex_reserve() {
+    static const uint64_t v = (uint64_t)(getenv("HOS_PS5_TEX_RESERVE_MB") ? atoi(getenv("HOS_PS5_TEX_RESERVE_MB")) : 1024) << 20;
+    return v;
+}
+static std::atomic<uint64_t> ps5_pressed_n{0}, ps5_restored_n{0};
+#endif
 namespace {
 
 uint64_t mix(uint64_t h, uint64_t v) {
@@ -1767,6 +1783,20 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         while (!x.sparse && astc && x.skip + 1 < x.levels && bytes_at(x.skip) > skip_from &&
                (std::max(x.width, x.height) >> x.skip) > max_dim)
             x.skip++;
+#ifdef __PROSPERO__
+        if (astc && !x.sparse) {   // (memory short: small for now, ps5_tex_reserve)
+            const uint64_t room = hos_ps5_direct_room(), reserve = ps5_tex_reserve();
+            const uint32_t cap = room < reserve / 2 ? 32 : 128;
+            while (room < reserve && x.skip + 1 < x.levels && (std::max(x.width, x.height) >> x.skip) > cap) x.skip++, x.pressed = true;
+            if (x.pressed) {
+                const uint64_t n = ++ps5_pressed_n;
+                if (n <= 5 || n % 200 == 0)
+                    logf("vk: memory short (%llu MB free, %llu kept for the game): ASTC textures made at %u texels at most for now "
+                         "(%llu so far, %llu made again at their own size)", (unsigned long long)(room >> 20),
+                         (unsigned long long)(reserve >> 20), cap, (unsigned long long)n, (unsigned long long)ps5_restored_n.load());
+            }
+        }
+#endif
         while (!x.sparse && x.skip + 1 < x.levels && bytes_at(x.skip) > max_bytes) x.skip++;
         if (x.skip) {
             static int logged;
@@ -3735,6 +3765,21 @@ void texture_frame(uint64_t completed) {
         evict.push_back({tex, !no_flush && !overwritten && tex->gpu_written && !tex->released && flushable(*tex), shifted});
         pending_bytes += tex->bytes + tex->pad;
     }
+#ifdef __PROSPERO__
+    // (PS5) the textures made small while memory was short, made again at their own size while more than the reserve and a
+    // quarter is free (ps5_tex_reserve): the most recently used first, two every ten presents. Not one the game has finalized
+    // (its memory may hold something else by now), one the GPU wrote, or one recorded work may still read
+    if (hos_ps5_direct_room() > ps5_tex_reserve() / 4 * 5) {
+        int n = 0;
+        for (auto it = order.rbegin(); it != order.rend() && n < 2; ++it) {
+            Texture* tex = it->second;
+            if (!tex->pressed || tex->gpu_written || tex->released || tex->last_value > completed) continue;
+            if (std::any_of(evict.begin(), evict.end(), [&](const Evict& e) { return e.tex == tex; })) continue;
+            evict.push_back({tex, false, false});
+            n++, ps5_restored_n++;
+        }
+    }
+#endif
     {   // (the write-backs: batches of up to 64 textures or ~512 MB of staging memory, each one submission and one wait)
         std::vector<Flush> batch;
         uint64_t batch_bytes = 0;
