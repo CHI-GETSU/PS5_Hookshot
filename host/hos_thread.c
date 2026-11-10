@@ -618,6 +618,10 @@ uint64_t hos_reserved_cpus(void) {
     if (mask != ~0ull) return mask;
     mask = 0;
     if (getenv("HOS_RESERVE_CORE") && !atoi(getenv("HOS_RESERVE_CORE"))) return mask;
+#ifdef __PROSPERO__   /* (PS5: none unless asked for. The replay runs on the threads that submit, which no pin moves to a kept
+                         core here (vk_replay.cpp: Windows only), so a core kept would be a core idle) */
+    if (!getenv("HOS_RESERVE_CORE")) return mask;
+#endif
 #if defined(_WIN32)
     {
         int cores = 0;

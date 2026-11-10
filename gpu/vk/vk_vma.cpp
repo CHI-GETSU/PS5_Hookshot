@@ -222,9 +222,41 @@ void vma_log_heaps() {
                       (unsigned long long)(b[h].usage >> 20), (unsigned long long)(b[h].budget >> 20));
     logf("%s", line);
 }
+#ifdef __PROSPERO__
+/// (PS5) What the renderer may hold of the console's one memory pool, which the game's own memory, the runtime's heap and
+/// the program share: its own blocks now, plus the largest free direct-memory piece less a reserve kept for the game (its
+/// pages are backed as it touches them: host/ps5/win32_ps5.c), at most HOS_PS5_RENDER_MB (2560). RADV's own figures do
+/// not fit here: its device heap was 8.6 GB "allowed", and its usage counts the game's pools the renderer imports, pages
+/// already counted as the game's: the renderer grew to 3.3 GB of blocks with "8.3 of 8.6 GB" used while the game's next
+/// page found no memory.
+extern "C" uint64_t hos_ps5_direct_free(void);   // (host/ps5/win32_ps5.c: the largest free piece)
+static uint64_t ps5_render_budget(uint64_t own) {
+    static const uint64_t cap = (getenv("HOS_PS5_RENDER_MB") ? (uint64_t)atoi(getenv("HOS_PS5_RENDER_MB")) : 2560) << 20;
+    static const uint64_t reserve = (getenv("HOS_PS5_RESERVE_MB") ? (uint64_t)atoi(getenv("HOS_PS5_RESERVE_MB")) : 2048) << 20;
+    const uint64_t free_now = hos_ps5_direct_free();
+    const uint64_t room = own + (free_now > reserve ? free_now - reserve : 0);
+    return std::min(cap, room);
+}
+#endif
 bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free) {
     VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
     vmaGetHeapBudgets(vma, b);
+#ifdef __PROSPERO__
+    {   // (what the renderer has allocated in its own blocks on every heap, against what the shared pool affords its blocks.
+        // Not the blocks themselves as "used": they do not shrink when a texture goes (780 MB of 2865 was free space inside them),
+        // so the texture budget's "97% of what is allowed" rule held for good at the cap and evicted ~380 MB every 10 presents,
+        // textures the last frames had used among them (1364 MB in use against a budget squeezed to 1185): foliage and
+        // lighting gone every other frame, and the uploads and encodes of making them again)
+        uint64_t own = 0, f = 0;
+        for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++) {
+            own += b[h].statistics.blockBytes;
+            f += b[h].statistics.blockBytes - std::min(b[h].statistics.blockBytes, b[h].statistics.allocationBytes);
+        }
+        *used = own - f, *budget = ps5_render_budget(own);
+        if (block_free) *block_free = 0;
+        return true;
+    }
+#endif
     uint64_t u = 0, t = 0, f = 0;
     for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
         if (dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
@@ -254,6 +286,17 @@ bool system_heap_usage(uint64_t* used, uint64_t* budget) {
     vmaSetCurrentFrameIndex(vma, ++budget_frame);
     VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
     vmaGetHeapBudgets(vma, b);
+#ifdef __PROSPERO__
+    {   // (PS5: imports of the game's pages cost nothing here; the renderer's own system-heap blocks against the same pool)
+        uint64_t own = 0, all = 0;
+        for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++) {
+            all += b[h].statistics.blockBytes;
+            if (!(dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) own += b[h].statistics.blockBytes;
+        }
+        *used = own, *budget = own + (ps5_render_budget(all) - std::min(ps5_render_budget(all), all));
+        return true;
+    }
+#endif
     uint64_t u = 0, t = 0;
     for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
         if (!(dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) u += b[h].usage, t += b[h].budget;

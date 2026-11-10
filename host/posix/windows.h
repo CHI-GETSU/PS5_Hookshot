@@ -99,6 +99,9 @@ typedef struct { LONG cx, cy; } SIZE;
 #define _getpid getpid
 #define _countof(a) (sizeof(a) / sizeof((a)[0]))
 #define _environ environ
+#ifdef __PROSPERO__
+extern char **environ;   /* (FreeBSD's unistd.h does not declare it for C++) */
+#endif
 #define _fileno fileno
 #define _chsize_s(fd, size) ftruncate((fd), (off_t)(size))
 #define _atoi64 atoll
@@ -152,12 +155,36 @@ void SetLastError(DWORD e);
 
 /* ---- locks: SRW locks are POSIX rwlocks (zero-initialised is valid, as on Windows); condition variables a futex
    word, so they wait with either an SRW lock or a critical section ---- */
+#ifdef __PROSPERO__
+/* (PS5) a futex reader-writer lock of our own (host/ps5/win32_ps5.c): the console's pthread_rwlock took twice as long
+   contended, with waits up to 5.8 ms where this one's were 0.45 ms (8 threads), and the scheduler's virtual-core queue
+   (one global SRW lock) waited 250 ms to 1.8 s for 1 ms timeouts on it */
+typedef struct { volatile uint32_t w; } SRWLOCK, *PSRWLOCK;
+#define SRWLOCK_INIT {0}
+void hos_srw_lock(SRWLOCK *l);
+void hos_srw_unlock(SRWLOCK *l);
+void hos_srw_lock_shared(SRWLOCK *l);
+void hos_srw_unlock_shared(SRWLOCK *l);
+int hos_srw_try_lock(SRWLOCK *l);
+int hos_srw_try_lock_shared(SRWLOCK *l);
+void hos_srw_release(SRWLOCK *l);   /* (either kind: SleepConditionVariableSRW's unlock) */
+#else
 typedef pthread_rwlock_t SRWLOCK, *PSRWLOCK;
 #define SRWLOCK_INIT PTHREAD_RWLOCK_INITIALIZER
+#endif
 typedef struct { volatile uint32_t seq; } CONDITION_VARIABLE, *PCONDITION_VARIABLE;
 #define CONDITION_VARIABLE_INIT {0}
 #define CONDITION_VARIABLE_LOCKMODE_SHARED 0x1
 typedef pthread_mutex_t CRITICAL_SECTION, *LPCRITICAL_SECTION;
+#ifdef __PROSPERO__
+static inline void InitializeSRWLock(SRWLOCK *l) { l->w = 0; }
+static inline void AcquireSRWLockExclusive(SRWLOCK *l) { hos_srw_lock(l); }
+static inline void ReleaseSRWLockExclusive(SRWLOCK *l) { hos_srw_unlock(l); }
+static inline void AcquireSRWLockShared(SRWLOCK *l) { hos_srw_lock_shared(l); }
+static inline void ReleaseSRWLockShared(SRWLOCK *l) { hos_srw_unlock_shared(l); }
+static inline BOOL TryAcquireSRWLockExclusive(SRWLOCK *l) { return hos_srw_try_lock(l); }
+static inline BOOL TryAcquireSRWLockShared(SRWLOCK *l) { return hos_srw_try_lock_shared(l); }
+#else
 static inline void InitializeSRWLock(SRWLOCK *l) { pthread_rwlock_init(l, NULL); }
 static inline void AcquireSRWLockExclusive(SRWLOCK *l) { pthread_rwlock_wrlock(l); }
 static inline void ReleaseSRWLockExclusive(SRWLOCK *l) { pthread_rwlock_unlock(l); }
@@ -165,6 +192,7 @@ static inline void AcquireSRWLockShared(SRWLOCK *l) { pthread_rwlock_rdlock(l); 
 static inline void ReleaseSRWLockShared(SRWLOCK *l) { pthread_rwlock_unlock(l); }
 static inline BOOL TryAcquireSRWLockExclusive(SRWLOCK *l) { return pthread_rwlock_trywrlock(l) == 0; }
 static inline BOOL TryAcquireSRWLockShared(SRWLOCK *l) { return pthread_rwlock_tryrdlock(l) == 0; }
+#endif
 void InitializeCriticalSection(CRITICAL_SECTION *cs);
 static inline BOOL InitializeCriticalSectionAndSpinCount(CRITICAL_SECTION *cs, DWORD n) { (void)n; InitializeCriticalSection(cs); return TRUE; }
 static inline void EnterCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_lock(cs); }

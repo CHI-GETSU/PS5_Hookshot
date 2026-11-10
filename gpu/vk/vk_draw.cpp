@@ -4463,6 +4463,13 @@ const char* stats_dir() {
     static const char* d = getenv("RX_VK_DRAW_STATS");
     return d && *d ? d : nullptr;
 }
+/// (PS5_Hookshot) RX_VK_DRAW_STATS_NO_QUERY=1: the capture without its pipeline statistics queries (every count 0): the PS5's RADV
+/// never answers one that holds a task or mesh draw, and the title hung at the first capture. The arguments as the GPU held them,
+/// the bindings and the buffer dumps are still written
+bool stats_no_query() {
+    static const bool v = getenv("RX_VK_DRAW_STATS_NO_QUERY") != nullptr;
+    return v;
+}
 bool stats_frame_now() {
     if (!stats_dir()) return false;
     const int64_t at = stats_frame.load(std::memory_order_relaxed);
@@ -4489,23 +4496,11 @@ bool stats_make_pool() {
     }
     return vkCreateQueryPool(dev.device, &qi, nullptr, &stats_pool) == VK_SUCCESS;
 }
-/// (each draw) arms a capture when the trigger file is there; writes the results once the measured frame is long done
-void stats_tick() {
+/// (the capture armed for a frame: stats_tick's, at the trigger file; or at once, for the frame being recorded: stats_arm_on)
+void stats_arm(int64_t at_frame) {
     const char* dir = stats_dir();
     if (!dir) return;
-    const int64_t frame = (int64_t)texture_frame_no();
-    const int64_t at = stats_frame.load(std::memory_order_relaxed);
-    if (at < 0) {
-        static std::atomic<int64_t> next_check{0};
-        const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::steady_clock::now().time_since_epoch()).count();
-        if (now < next_check.load(std::memory_order_relaxed)) return;
-        next_check.store(now + 500, std::memory_order_relaxed);
-        const std::string trigger = std::string(dir) + "/draw_stats.now";   // ('/': both systems take it; '\\' made a file beside the folder on Linux)
-        FILE* f = fopen(trigger.c_str(), "rb");
-        if (!f) return;
-        fclose(f);
-        std::remove(trigger.c_str());
+    {
         std::lock_guard lk(stats_mu);
         if (stats_frame.load() >= 0) return;
         if (!stats_pool && !stats_make_pool()) {
@@ -4540,8 +4535,37 @@ void stats_tick() {
         }
         stats_used.store(0);
         stats_written.store(false);
-        stats_frame.store(frame + 2);   // (a frame not yet started on any replay thread)
-        logf("vk: draw stats: measuring frame %lld%s", (long long)(frame + 2), stats_mesh_bits ? " (with task and mesh counts)" : "");
+        stats_frame.store(at_frame);
+        logf("vk: draw stats: measuring frame %lld%s", (long long)at_frame, stats_mesh_bits ? " (with task and mesh counts)" : "");
+    }
+}
+/// (PS5_Hookshot) RX_VK_DRAW_STATS_ON=<program key>: the capture armed by that compute program's first dispatch, for the frame it is
+/// in, from that dispatch on: a chain of passes caught in the frame it first runs in (a scene's first), which no trigger file hits
+void stats_arm_on(uint64_t prog) {
+    static const uint64_t want = getenv("RX_VK_DRAW_STATS_ON") ? strtoull(getenv("RX_VK_DRAW_STATS_ON"), nullptr, 16) : 0;
+    static const int skip = getenv("RX_VK_DRAW_STATS_ON_SKIP") ? atoi(getenv("RX_VK_DRAW_STATS_ON_SKIP")) : 0;   // (its n-th dispatch)
+    static std::atomic<int> seen{0};
+    if (!want || prog != want || seen.fetch_add(1) != skip) return;
+    stats_arm((int64_t)texture_frame_no());
+}
+/// (each draw) arms a capture when the trigger file is there; writes the results once the measured frame is long done
+void stats_tick() {
+    const char* dir = stats_dir();
+    if (!dir) return;
+    const int64_t frame = (int64_t)texture_frame_no();
+    const int64_t at = stats_frame.load(std::memory_order_relaxed);
+    if (at < 0) {
+        static std::atomic<int64_t> next_check{0};
+        const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now < next_check.load(std::memory_order_relaxed)) return;
+        next_check.store(now + 500, std::memory_order_relaxed);
+        const std::string trigger = std::string(dir) + "/draw_stats.now";   // ('/': both systems take it; '\\' made a file beside the folder on Linux)
+        FILE* f = fopen(trigger.c_str(), "rb");
+        if (!f) return;
+        fclose(f);
+        std::remove(trigger.c_str());
+        stats_arm(frame + 2);   // (a frame not yet started on any replay thread)
         return;
     }
     if (frame < at + 8 || stats_written.load()) return;
@@ -4550,7 +4574,7 @@ void stats_tick() {
     const uint32_t n = std::min(stats_used.load(), kStatsQueries);
     const uint32_t words = stats_mesh_bits ? 7 : 5;   // (in bit order: vs, clip in, clip out, fs, cs, [task, mesh])
     std::vector<uint64_t> r((size_t)n * words);
-    VkResult res = n ? vkGetQueryPoolResults(dev.device, stats_pool, 0, n, r.size() * 8, r.data(), (VkDeviceSize)words * 8,
+    VkResult res = n && !stats_no_query() ? vkGetQueryPoolResults(dev.device, stats_pool, 0, n, r.size() * 8, r.data(), (VkDeviceSize)words * 8,
                                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT)
                      : VK_SUCCESS;
     struct Sum {
@@ -4617,6 +4641,26 @@ void stats_tick() {
         {
             std::lock_guard bl(stats_bind_mu);
             binds = stats_binds;
+        }
+        // (PS5_Hookshot) RX_VK_DRAW_STATS_ADDRS=<gpu address>,...: every binding of this frame that holds one of them: who reads
+        // and who writes a buffer, when the question is which program should have filled it
+        if (const char* want = getenv("RX_VK_DRAW_STATS_ADDRS")) {
+            for (const char* q = want; *q;) {
+                char* end;
+                const uint64_t a = strtoull(q, &end, 16);
+                if (end == q) break;
+                q = *end ? end + 1 : end;
+                fprintf(f, "\n# bindings that hold %#llx:\n", (unsigned long long)a);
+                std::vector<std::tuple<uint64_t, int, uint64_t, uint64_t, bool>> seen;
+                for (const StatsBind& b : binds) {
+                    if (!b.addr || a < b.addr || a >= b.addr + b.size) continue;
+                    const std::tuple<uint64_t, int, uint64_t, uint64_t, bool> k{b.prog, b.stage, b.addr, b.size, b.written};
+                    if (std::find(seen.begin(), seen.end(), k) != seen.end()) continue;
+                    seen.push_back(k);
+                    fprintf(f, "  %016llx s%d %s %#llx +%#llx  from c%u+%#x%s\n", (unsigned long long)b.prog, b.stage, b.written ? "W" : "r",
+                            (unsigned long long)b.addr, (unsigned long long)b.size, b.cbuf, b.off, b.table ? " (table entry)" : "");
+                }
+            }
         }
         // (RX_VK_DRAW_STATS_PROGS=<key>,...: every storage buffer those programs bound in this frame)
         if (const char* want = getenv("RX_VK_DRAW_STATS_PROGS")) {
@@ -4828,7 +4872,7 @@ struct StatsQuery {
         own = d;
         is_dispatch = dispatch;
         if (dispatch) copy_args(c, own, i);   // (before the dispatch: outside any pass already)
-        vkCmdBeginQuery(c, stats_pool, i, 0);
+        if (!stats_no_query()) vkCmdBeginQuery(c, stats_pool, i, 0);
         cmd = c, index = i;
     }
     bool is_dispatch = false;
@@ -4836,7 +4880,7 @@ struct StatsQuery {
     uint64_t prog = 0;
     ~StatsQuery() {
         if (!cmd) return;
-        vkCmdEndQuery(cmd, stats_pool, index);
+        if (!stats_no_query()) vkCmdEndQuery(cmd, stats_pool, index);
         if (!is_dispatch) copy_args(cmd, *draw, index);   // (a dispatch's were copied before it ran: begin)
         if (is_dispatch) copy_watch(cmd, index);
         if (state) gpu_dump(cmd, *state, prog, is_dispatch);
@@ -5819,15 +5863,17 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
                 }
             }
         }
-        {   // (RX_VK_LOG_MESH_INDIRECT=1: what indirect mesh draws hold, 300 lines)
+        {   // (RX_VK_LOG_MESH_INDIRECT=<frame>: what indirect mesh draws hold from that frame on, 600 lines)
             static const bool on = getenv("RX_VK_LOG_MESH_INDIRECT") != nullptr;
+            static const uint64_t from = on ? (uint64_t)atoll(getenv("RX_VK_LOG_MESH_INDIRECT")) : 0;
             static std::atomic<int> told{0};
-            if (on && d.indirect && told < 300) {
+            if (on && d.indirect && told < 600 && texture_frame_no() >= from) {
                 uint32_t w[12]{}, cnt = 0;
                 host->gpu_read(d.indirect, w, sizeof w);
                 if (d.count_addr) host->gpu_read(d.count_addr, &cnt, 4);
                 told++;
-                logf("vk: mesh indirect prog %016llx: stride %d max %d count %u (at %#llx): %u %u %u %u %u %u %u %u", (unsigned long long)p.key, d.stride, d.max, cnt,
+                logf("vk: mesh indirect frame %llu prog %016llx: args %#llx stride %d max %d count %u (at %#llx): %u %u %u %u %u %u %u %u",
+                     (unsigned long long)texture_frame_no(), (unsigned long long)p.key, (unsigned long long)d.indirect, d.stride, d.max, cnt,
                      (unsigned long long)d.count_addr, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
             }
         }
@@ -6977,6 +7023,25 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         st_waits++;
         st_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     }
+    if (cp) stats_arm_on(cp->key);
+    {   // (PS5_Hookshot, diagnostics) RX_VK_LOG_PROG=<program key>: that compute program's dispatches, 200 of them: the frame, the
+        // grid and where its first storage buffers are, for following a chain of passes from a scene's first frame
+        static const uint64_t want = getenv("RX_VK_LOG_PROG") ? strtoull(getenv("RX_VK_LOG_PROG"), nullptr, 16) : 0;
+        static std::atomic<int> told{0};
+        // (RX_VK_LOG_PROGS_AT=<from>:<to>: every compute program's dispatches in those frames, 12000 lines)
+        static const char* at = getenv("RX_VK_LOG_PROGS_AT");
+        static const uint64_t at_from = at ? strtoull(at, nullptr, 10) : 0, at_to = at && strchr(at, ':') ? strtoull(strchr(at, ':') + 1, nullptr, 10) : 0;
+        static std::atomic<int> told_all{0};
+        if (at && cp && texture_frame_no() >= at_from && texture_frame_no() <= at_to && told_all++ < 12000)
+            logf("vk: cs frame %llu prog %016llx grid %ux%ux%u%s ssbo0 %#llx ssbo3 %#llx", (unsigned long long)texture_frame_no(),
+                 (unsigned long long)cp->key, s.grid[0], s.grid[1], s.grid[2], indirect ? " (indirect)" : "",
+                 (unsigned long long)s.ssbo[5][0].addr, (unsigned long long)s.ssbo[5][3].addr);
+        if (want && cp && cp->key == want && told++ < 200)
+            logf("vk: prog %016llx frame %llu grid %ux%ux%u%s ready %d failed %d ssbo %#llx %#llx %#llx %#llx %#llx", (unsigned long long)want,
+                 (unsigned long long)texture_frame_no(), s.grid[0], s.grid[1], s.grid[2], indirect ? " (indirect)" : "",
+                 (int)cp->ready.load(), (int)cp->failed, (unsigned long long)s.ssbo[5][0].addr, (unsigned long long)s.ssbo[5][1].addr,
+                 (unsigned long long)s.ssbo[5][2].addr, (unsigned long long)s.ssbo[5][3].addr, (unsigned long long)s.ssbo[5][4].addr);
+    }
     if (!cp || cp->failed) {   // (hookshot) the program's resources, once a control section: what a rejected dispatch reads/writes
         static std::mutex mu2;
         static std::unordered_set<uint64_t> seen2;
@@ -7453,7 +7518,8 @@ int64_t draw_slotgen_saves() {   // (RX_VK_DESC_SLOTGEN: of those, what the glob
 }
 
 void pipeline_cache_save(bool force) {
-    if (!pcache || (!force && pcache_built_since_save < 32)) return;
+    static const bool always = getenv("RX_VK_PCACHE_SAVE_ALWAYS") != nullptr;   // (a test: a save at every call, to time it)
+    if (!pcache || (!force && !always && pcache_built_since_save < 32)) return;
     pcache_built_since_save = 0;
     // (on a thread of its own unless forced, at exit: ~100 MB fetched and written took the replay thread 100+ ms at
     // each scene change; the cache is internally synchronized, pipelines go on being built meanwhile)
@@ -7467,9 +7533,12 @@ void pipeline_cache_save(bool force) {
         struct Done { ~Done() { busy = false; } } done;
         try {
             size_t n = 0;
+            const auto t0 = std::chrono::steady_clock::now();
+            auto t1 = t0;
             if (vkGetPipelineCacheData(dev.device, pcache, &n, nullptr) == VK_SUCCESS && n) {
                 std::vector<uint8_t> data(n);
                 if (vkGetPipelineCacheData(dev.device, pcache, &n, data.data()) == VK_SUCCESS) {
+                    t1 = std::chrono::steady_clock::now();
                     const std::string tmp = pcache_path + ".tmp";
                     if (FILE* f = fopen(tmp.c_str(), "wb")) {
                         const bool ok = fwrite(data.data(), 1, n, f) == n;
@@ -7477,6 +7546,13 @@ void pipeline_cache_save(bool force) {
                         if (ok) MoveFileExA(tmp.c_str(), pcache_path.c_str(), MOVEFILE_REPLACE_EXISTING);
                     }
                 }
+            }
+            {   // (what a save costs: the driver's part holds its cache, the file's does not)
+                const auto t2 = std::chrono::steady_clock::now();
+                static std::atomic<int> told{0};
+                if (told++ < 40)
+                    logf("vk: pipeline cache saved: %zu KB, %.0f ms from the driver, %.0f ms to the file", n >> 10,
+                         std::chrono::duration<double, std::milli>(t1 - t0).count(), std::chrono::duration<double, std::milli>(t2 - t1).count());
             }
         } catch (const std::exception& e) {
             logf("vk: pipeline cache save failed: %s", e.what());

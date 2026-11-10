@@ -40,6 +40,9 @@
 #endif
 #include "shaders/wb_diff_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
+#ifdef __PROSPERO__
+extern "C" int hos_ps5_commit_now(void* addr, size_t size);   // (host/ps5/win32_ps5.c)
+#endif
 
 namespace mkwvk {
 namespace {
@@ -77,6 +80,7 @@ uint64_t mem_rec_value = 0, mem_completed = 0;   // (the recording being made, a
 
 struct GuestPool {
     uint64_t lo = 0, hi = 0;   // (aligned outwards the same way, so an import covers what the lookup found)
+    uint64_t glo = 0, ghi = 0;   // (the game's own pool, as it made it: game_pool_of)
 };
 
 std::vector<GuestPool> guest_pools;   // by lo, from the host
@@ -355,6 +359,9 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
     // some). The pages were queried one region at a time before, so as to commit only the reserved ones: the queries were
     // ~33 ms of an import's ~70 ms in the game's huge reservation (on the replay thread, at a pool's first binding), the
     // call 1.3 ms. Where it fails, as before
+#ifdef __PROSPERO__   // (PS5: backed now whatever the size: large commits are otherwise left to first touch, host/ps5/win32_ps5.c)
+    hos_ps5_commit_now(ptr, (size_t)bytes);
+#endif
     if (VirtualAlloc(ptr, (SIZE_T)bytes, MEM_COMMIT, PAGE_READWRITE) != ptr)
         for (uint8_t* q = ptr; q < ptr + bytes;) {
             MEMORY_BASIC_INFORMATION mi{};
@@ -568,6 +575,7 @@ void memory_sync() {
         GuestPool p;
         p.lo = list[i][0] & ~(align - 1);
         p.hi = (list[i][0] + list[i][1] + align - 1) & ~(align - 1);
+        p.glo = list[i][0], p.ghi = list[i][0] + list[i][1];
         next.push_back(p);
     }
     std::sort(next.begin(), next.end(), [](const GuestPool& a, const GuestPool& b) { return a.lo < b.lo; });
@@ -593,10 +601,10 @@ std::vector<uint32_t> region_gen(kPages / kRegionPages);
 // write, hundreds of MB) marks whole regions, not 512 pages each; it took dispatches 8-150 ms)
 std::vector<uint32_t> region_full(kPages / kRegionPages);
 inline uint32_t load_u32(uint32_t& x) {
-    return std::atomic_ref<uint32_t>(x).load(std::memory_order_acquire);
+    return __atomic_load_n(&x, __ATOMIC_ACQUIRE);   // (std::atomic_ref: not in every C++ library, the PS5 SDK's among them)
 }
 inline void store_u32(uint32_t& x, uint32_t v) {
-    std::atomic_ref<uint32_t>(x).store(v, std::memory_order_release);
+    __atomic_store_n(&x, v, __ATOMIC_RELEASE);
 }
 inline uint32_t page_gen(uint64_t p) {
     const auto& c = gen_chunks[p / kChunkPages];
@@ -2450,8 +2458,19 @@ static bool game_pool_of(uint64_t gpu, uint64_t& lo, uint64_t& hi) {   // (pools
     auto it = std::upper_bound(guest_pools.begin(), guest_pools.end(), gpu, [](uint64_t a, const GuestPool& p) { return a < p.lo; });
     if (it == guest_pools.begin()) return false;
     --it;
+    // (PS5_Hookshot) the game's own pool, not the span an import of it takes. The PS5 imports in 16 KB steps and the game's pools
+    // are whole 4 KB pages laid end to end: rounded outwards each "pool" ran up to 12 KB into the next, and a table entry bound
+    // "to its pool's end" lay over the next entry's buffer, as it does on no PC. The rounded spans overlap, so the pool that holds
+    // the address is looked for among the ones just below it
+    for (auto g = it; ; --g) {
+        if (gpu >= g->glo && gpu < g->ghi) {
+            lo = g->glo, hi = g->ghi;
+            return true;
+        }
+        if (g == guest_pools.begin() || it - g >= 8) break;
+    }
     if (gpu < it->lo || gpu >= it->hi) return false;
-    lo = it->lo, hi = it->hi;
+    lo = it->lo, hi = it->hi;   // (in the rounding only: as before)
     return true;
 }
 /// True when gpu sits in [lo, hi) and that span was cached from the guest-pool table this generation still is.

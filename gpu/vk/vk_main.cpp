@@ -108,7 +108,11 @@ bool create_instance() {
         vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
         std::vector<VkExtensionProperties> all(n);
         vkEnumerateInstanceExtensionProperties(nullptr, &n, all.data());
+#ifdef __PROSPERO__   // (the console: one display, a plane surface on it, host/ps5/hos_sdl_ps5.c)
+        for (const char* want : {"VK_KHR_display"})
+#else
         for (const char* want : {"VK_KHR_xlib_surface", "VK_KHR_xcb_surface", "VK_KHR_wayland_surface"})
+#endif
             if (has_extension(all, want)) exts[n_exts++] = want;
     }
 #endif
@@ -207,6 +211,23 @@ bool pick_device() {
     }
     dev.physical = all[best];
     vkGetPhysicalDeviceProperties(dev.physical, &dev.props);
+    // (PS5) Storage buffers bound from offsets that are multiples of 256, not of the 4 the console's RADV reports. OoT's culling
+    // keeps two sets of lists, one a frame; the pass that rebuilds a set reads a table through a pointer at +0x9c0 of a page,
+    // bound from there in one of the two sets only, and on the console that set stayed empty: its foliage, grass and falling
+    // leaves were drawn every other frame (measured against this game built for a PC: the same dispatch with the same inputs
+    // filled the list there). Bound from +0x900 the list fills. Why is not established: the driver reads and writes buffers
+    // bound at these offsets correctly in a test of its own, so the cause is likely what the program reads just below +0x9c0,
+    // which the wider binding now holds. The shaders take the rest of an address themselves (Profile::min_ssbo_alignment).
+    // RX_VK_SSBO_ALIGN=<bytes>: another, on any GPU
+    {
+#ifdef __PROSPERO__
+        VkDeviceSize want = 256;
+#else
+        VkDeviceSize want = 0;
+#endif
+        if (const char* e = getenv("RX_VK_SSBO_ALIGN")) want = (VkDeviceSize)atoll(e);
+        dev.props.limits.minStorageBufferOffsetAlignment = std::max(dev.props.limits.minStorageBufferOffsetAlignment, want);
+    }
     vkGetPhysicalDeviceMemoryProperties(dev.physical, &dev.memory);
     return true;
 }

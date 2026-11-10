@@ -174,6 +174,12 @@ struct KeyHash {
 std::unordered_map<Key, std::unique_ptr<Texture>, KeyHash> textures;
 std::unordered_multimap<uint64_t, Texture*> by_gpu;
 uint64_t frame_no = 1;
+// (RufflezAU's Steam Deck fork) the eviction's age in milliseconds, not presents: at 4-6 fps "unused for 60 presents" is
+// 10-15 s, and the texture set ran far past the budget between sweeps. Read once a present (texture_frame), not at each touch
+static uint64_t clock_ms() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+uint64_t frame_ms = clock_ms();
 uint64_t total_bytes = 0;
 
 // (RX_VK_LOG_REMADE=1) Textures evicted and made again within 600 frames, and those of them that were then sampled
@@ -2177,6 +2183,7 @@ bool upload_defer(const Texture& tex) {
 }  // namespace
 Texture* texture_touch(Texture* tex, bool for_sampling) {
     tex->last_frame = frame_no;
+    tex->last_ms = frame_ms;
     tex->last_value = rec_value;
     if (!for_sampling) return tex;
     if (upload_defer(*tex)) return nullptr;
@@ -2911,6 +2918,7 @@ void texture_written(Texture* tex) {
 
 bool texture_touch_quick(Texture* tex, bool for_sampling) {
     tex->last_frame = frame_no;   // (the same values whichever thread stores them)
+    tex->last_ms = frame_ms;
     tex->last_value = rec_value;
     if (!for_sampling) return true;
     if (tex->gpu_written && !tex->released && !tex->only_cleared) return true;
@@ -3231,6 +3239,7 @@ void texture_frame(uint64_t completed) {
     }
     completed_value = completed;
     frame_no++;
+    frame_ms = clock_ms();
     {   // (staging arenas the GPU is done with, beyond 256 MB of them, and any over 64 MB: freed. A scene change stages
         // hundreds of MB to over a GB (the course maps, the terrain's ASTC arrays), and that host memory was kept)
         // (hookshot: 64 on a card of 6 GB or less. On one with resizable BAR the arenas are VRAM: VMA puts a host-visible buffer the GPU
@@ -3474,14 +3483,15 @@ void texture_frame(uint64_t completed) {
     uint64_t longest = 0;
     for (const Texture* t : by_start) longest = std::max(longest, t->guest_size);
     std::vector<Texture*> gone;
-    // (over the budget, what goes has gone unused for RX_VK_EVICT_MIN_UNUSED frames, 60 by default; it was 8. On an
+    // (over the budget, what goes has gone unused for RX_VK_EVICT_MIN_MS milliseconds, 1000 by default (it was 60 frames, before
+    // that 8). On an
     // 8 GB laptop card the VRAM sits at the driver's limit, the budget shrinks and this runs every 10 frames: with 8,
     // ~300 textures in a few minutes of Kokiri Forest were evicted and made again, all of them within 60 frames (200
     // within 10), uploaded and decoded again each time; and a 260 x 260 one the GPU renders and the game samples every
     // 40 frames came back empty each time (22 times; the lit ground black for a frame, a tiled pattern over the ground).
     // With 60: 2. The textures that are really done with still go, 52 frames later)
-    static const uint64_t min_unused =
-        getenv("RX_VK_EVICT_MIN_UNUSED") ? (uint64_t)std::max(1, atoi(getenv("RX_VK_EVICT_MIN_UNUSED"))) : 60;
+    static const uint64_t min_unused_ms =
+        getenv("RX_VK_EVICT_MIN_MS") ? (uint64_t)std::max(1, atoi(getenv("RX_VK_EVICT_MIN_MS"))) : 1000;
     // (hookshot) a render target another image has since been drawn over (same storage, another size or format:
     // OoT's dynamic resolution makes a new set at each size in the same pool memory) holds nothing any more: it
     // goes like any other. Kept, they were 3.6 GB of 4.5 GB rendered, VRAM near the driver's limit, and the
@@ -3552,8 +3562,8 @@ void texture_frame(uint64_t completed) {
         logf("vk: finalized textures the GPU drew once, kept for being made again: %zu (%llu KB):%s", finalized_kept_n,
              (unsigned long long)(finalized_kept >> 10), n ? line : "");
     }
-    const uint64_t need_unused = sweep ? std::max<uint64_t>(120, min_unused) : min_unused;
-    const uint64_t need_dead = dead_targets ? std::min(need_unused, dead_min_unused) : need_unused;
+    const uint64_t need_ms = sweep ? std::max<uint64_t>(2000, min_unused_ms) : min_unused_ms;
+    const auto young = [&](const Texture* t) { return frame_ms - t->last_ms < need_ms; };
     static uint64_t n_dead, b_dead, dead_logged_at;
     // (hookshot) the textures to go are chosen first and destroyed after; the write-backs among them go to the GPU in a few
     // batches (flush_textures), not one submission and one wait each: a sweep of 500 at a scene load stalled for seconds
@@ -3563,9 +3573,9 @@ void texture_frame(uint64_t completed) {
     for (auto& [last, tex] : order) {
         // (total_bytes can have drifted below the textures' sum (destroy_later clamps it): the chosen ones' bytes past it mean the
         // budget is met, not a wrapped difference that never is)
-        if ((!sweep && (pending_bytes >= total_bytes || total_bytes - pending_bytes <= budget / 8 * 7)) || frame_no - last < need_dead) break;
+        if ((!sweep && (pending_bytes >= total_bytes || total_bytes - pending_bytes <= budget / 8 * 7)) || (dead_targets ? frame_no - last < dead_min_unused : young(tex))) break;
         const bool shifted = drawn_over_shifted(tex);
-        if (frame_no - last < need_unused && !shifted) continue;   // (younger: only a dead transient target goes)
+        if (young(tex) && !shifted) continue;   // (younger: only a dead transient target goes)
         if (tex->last_value > completed) continue;
         // (nor what the GPU wrote and the game still has: the image is its only copy, and one made again over that
         // storage started empty or from stale memory: a sky or course texture drawn once, garbage from then on.

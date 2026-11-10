@@ -148,6 +148,7 @@
     X(vkCmdDrawMeshTasksIndirectCountEXT) X(vkCmdPushDescriptorSetKHR) X(vkCreateBufferView) X(vkDestroyBufferView) \
     X(vkDestroySampler) X(vkDestroyDescriptorSetLayout) X(vkDestroyPipelineLayout) X(vkDestroyDescriptorPool) \
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData) X(vkCmdFillBuffer) \
+    X(vkCmdPipelineBarrier) X(vkCmdWriteTimestamp) X(vkUnmapMemory) /* (PS5_MihawkGen's generator: vk_framegen.cpp) */ \
     X(vkCmdResolveImage) X(vkCmdBeginConditionalRenderingEXT) X(vkCmdEndConditionalRenderingEXT) \
     X(vkCmdSetLineWidth) X(vkCmdSetDepthClampEnableEXT) X(vkCmdSetPolygonModeEXT) X(vkCmdSetColorWriteMaskEXT) \
     X(vkCmdSetColorBlendEnableEXT) X(vkCmdSetColorBlendEquationEXT) X(vkCmdSetLogicOpEnableEXT) \

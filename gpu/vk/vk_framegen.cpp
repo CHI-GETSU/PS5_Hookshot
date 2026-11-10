@@ -23,6 +23,9 @@
 #include "vk_fsr3_inputs.h"   // (AMD FSR 3.1 frame interpolation's depth and motion)
 #include "vk_fsr3fi.h"
 #include "vk_menu.h"
+#ifdef HOOKSHOT_MIHAWKGEN
+#include "framegen.h"   // (PS5_MihawkGen's generator, framegen/include: ps5/build.py)
+#endif
 #include "vk_texture.h"
 
 #include "shaders/fg_copy_comp_spv.h"
@@ -307,8 +310,98 @@ void to_general(VkCommandBuffer cmd, VkImage image) {
     vkCmdPipelineBarrier2(cmd, &d);
 }
 
+#ifdef HOOKSHOT_MIHAWKGEN
+// (PS5_Hookshot) PS5_MihawkGen's trained network makes the frames between two of the game's, from their colour alone, at any
+// place between them (as PS5_RetroArch's tooling/framegen drives it): in place of the block matching below and of FSR 3.1's
+// midpoint. The generator keeps a descriptor set for each slot, and a slot is free again only once the recording that used it
+// has run: a slot for each made frame of each of the three sets, whose frames are shown before the set is filled again. It has
+// 8 slots, so two made frames a set (2x and 3x); more than that stays with the block matching.
+// RX_VK_MIHAWKGEN=0: off. RX_VK_MIHAWKGEN_NET=<file>: the network (default framegen/network.fgw beside the game).
+constexpr int kNeuralASet = 2;
+struct Neural {
+    fg_context* ctx = nullptr;
+    bool tried = false;
+    std::vector<uint8_t> weights;
+} neural;
+
+void neural_drop() {   // (with drop_size: the device is idle)
+    if (neural.ctx) fg_context_destroy(neural.ctx);
+    neural.ctx = nullptr;
+    neural.tried = false;
+}
+
+bool neural_ready() {   // (after ensure_size: the context is made for the frames' size)
+    if (neural.tried) return neural.ctx != nullptr;
+    neural.tried = true;
+    if (const char* e = getenv("RX_VK_MIHAWKGEN"); e && e[0] == '0') return false;
+    const char* path = getenv("RX_VK_MIHAWKGEN_NET");
+#ifdef __PROSPERO__
+    if (!path) path = "/app0/framegen/network.fgw";
+#else
+    if (!path) path = "framegen/network.fgw";
+#endif
+    if (neural.weights.empty())
+        if (FILE* f = fopen(path, "rb")) {
+            uint8_t part[65536];
+            for (size_t n; (n = fread(part, 1, sizeof part, f)) > 0;) neural.weights.insert(neural.weights.end(), part, part + n);
+            fclose(f);
+        }
+    char error[256] = "no network file";
+    const fg_create_info info{dev.device, dev.physical, fg.w, fg.h, 3 * kNeuralASet, VK_FORMAT_R8G8B8A8_UNORM, 0, 0};
+    if (neural.weights.empty() || fg_context_create(&info, &neural.ctx, error, sizeof error) != VK_SUCCESS ||
+        fg_context_load_network(neural.ctx, neural.weights.data(), neural.weights.size(), error, sizeof error) != VK_SUCCESS) {
+        logf("vk: MihawkGen: %s (%s): the renderer's own interpolation makes the frames", error, path);
+        if (neural.ctx) fg_context_destroy(neural.ctx);
+        neural.ctx = nullptr;
+        return false;
+    }
+    logf("vk: MihawkGen: its network makes the frames between the game's (%ux%u, %zu bytes of weights)", fg.w, fg.h,
+         neural.weights.size());
+    return true;
+}
+
+void neural_layout(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to) {
+    VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.srcAccessMask = b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.imageMemoryBarrierCount = 1;
+    d.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
+}
+
+/// The n frames at t[k] between fg.frames[prev] and fg.frames[cur] into out[k] (set: which of fg.sets they are for); false
+/// when the network does not make them (off, no network, more than a set's slots), and nothing is recorded
+bool neural_frames(VkCommandBuffer cmd, int set, int prev, int cur, int n, const float* t, const VkImageView* out) {
+    if (n < 1 || n > kNeuralASet || !neural_ready()) return false;
+    // (the generator reads its inputs as sampled images in the read-only layout and writes the output in GENERAL: framegen.h)
+    for (int i : {prev, cur})
+        neural_layout(cmd, fg.frames[i].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    for (int k = 0; k < n; k++) {
+        const VkImageView a = fg.frames[prev].view, b = fg.frames[cur].view;
+        const fg_frame_pair pair{a, b, a, b, b, t[k]};   // (the network reads the two colours only)
+        fg_record_generate(neural.ctx, cmd, (uint32_t)(set * kNeuralASet + k), FG_METHOD_NEURAL, &pair, out[k]);
+    }
+    note_work();   // (the generator's dispatches are not counted: the barriers after them are not left out)
+    for (int i : {prev, cur})
+        neural_layout(cmd, fg.frames[i].image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+    static uint64_t made = 0, calls = 0;
+    made += (uint64_t)n;
+    if (++calls % 600 == 0) logf("vk: MihawkGen: %llu frames made in the last 600 presents", (unsigned long long)made), made = 0;
+    return true;
+}
+#endif
+
 // Only after the display jobs and device have drained (ensure_size), or before any frame used these images.
 void drop_size() {
+#ifdef HOOKSHOT_MIHAWKGEN
+    neural_drop();
+#endif
     for (int i = 0; i < 2; i++) {
         drop_img(fg.frames[i]), drop_img(fg.lumas[i]), drop_img(fg.flows[i]);
     }
@@ -669,7 +762,17 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         } else {   // (nothing to blend from: the game's frame, and the timeline starts at it)
             n = 1, t[0] = 1.0f, at[0] = now, fg.slot_next = now + period;
         }
-        bool flow = false;
+        bool flow = false, neural_made = false;
+#ifdef HOOKSHOT_MIHAWKGEN
+        if (blend) {   // (PS5_MihawkGen's network makes them where it can: neural_frames)
+            float nt[kMaxMult];
+            VkImageView out[kMaxMult];
+            int made = 0;
+            for (int k = 0; k < n; k++)
+                if (t[k] <= 0.999f) nt[made] = t[k], out[made++] = set->frame[k].view;
+            neural_made = neural_frames(cmd, (int)(set - fg.sets), prev, cur, made, nt, out);
+        }
+#endif
         for (int k = 0; k < n; k++) {
             set->game[k] = t[k] > 0.999f;
             set->due[k] = at[k] + fg.game_ns;
@@ -680,6 +783,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
                                VK_IMAGE_LAYOUT_GENERAL, 1, &c);
                 continue;
             }
+            if (neural_made) continue;
             if (!flow) {
                 flow = true;
                 pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},
@@ -701,7 +805,15 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     }
     // (hookshot) At 2x, AMD FSR 3.1's frame interpolation where it runs; it makes the midpoint only, so 3x and more (and Auto,
     // above) stay with the interpolation below, as does any present it does not take
-    if (blend && m == 2 && fsr3fi::frames_wanted()) set->made = fsr3fi_frame(cmd, *set, cur, uw, uh, sequence);
+#ifdef HOOKSHOT_MIHAWKGEN
+    if (blend && m > 1) {   // (PS5_MihawkGen's network first, where it is built in and makes them: neural_frames)
+        float nt[kMaxMult];
+        VkImageView out[kMaxMult];
+        for (int k = 1; k < m; k++) nt[k - 1] = (float)k / (float)m, out[k - 1] = set->frame[k - 1].view;
+        if (neural_frames(cmd, (int)(set - fg.sets), prev, cur, m - 1, nt, out)) set->made = m - 1;
+    }
+#endif
+    if (set->made == 0 && blend && m == 2 && fsr3fi::frames_wanted()) set->made = fsr3fi_frame(cmd, *set, cur, uw, uh, sequence);
     if (set->made == 0 && blend && m > 1) {
         pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},
                             {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch);

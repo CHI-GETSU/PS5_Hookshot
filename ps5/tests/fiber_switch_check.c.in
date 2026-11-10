@@ -1,0 +1,47 @@
+/* host/posix/win32_posix.c's PS5 fiber switch (@ASM@, taken from that file) on the PC: two switches on one thread, then
+   the fiber resumed on another; it must run as the resuming thread, on an aligned stack. ps5/tests/fiber_switch_check.sh */
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+@ASM@
+typedef struct { void *sp; void (*fn)(void *); void *param; } Fiber;
+static __thread Fiber *cur;
+static Fiber main_a, main_b, *f1;
+static int steps; static long ran_on[8]; static long tid_b; static int aligned_ok = 1;
+static void fiber_start(Fiber *f) { f->fn(f->param); abort(); }
+static void sw(Fiber *to) { Fiber *from = cur; cur = to; hos_fiber_swap(&from->sp, to->sp); }
+static Fiber *mk(void (*fn)(void *), void *param) {
+    Fiber *f = calloc(1, sizeof *f); size_t size = 1 << 20; char *stack = malloc(size);
+    uint64_t *sp = (uint64_t *)(((uintptr_t)stack + size) & ~(uintptr_t)15) - 10; uint16_t fcw;
+    __asm__ volatile("fnstcw %0" : "=m"(fcw));
+    sp[0] = fcw, sp[1] = __builtin_ia32_stmxcsr(); sp[2] = sp[3] = 0; sp[4] = (uint64_t)f; sp[5] = (uint64_t)fiber_start;
+    sp[6] = sp[7] = 0; sp[8] = (uint64_t)hos_fiber_entry; sp[9] = 0; f->sp = sp; f->fn = fn; f->param = param; return f;
+}
+static Fiber *back;
+static void body(void *p) {
+    for (;;) {
+        double d = 1.5; volatile __attribute__((aligned(16))) char probe[16];
+        if (((uintptr_t)probe & 15) != 0) aligned_ok = 0;
+        ran_on[steps] = syscall(SYS_gettid); steps++;
+        d *= 2.0; if (d != 3.0) abort();
+        sw(back);
+    }
+}
+static void *second(void *u) {
+    tid_b = syscall(SYS_gettid); cur = &main_b; back = &main_b;
+    sw(f1);   /* the fiber made on the main thread, resumed here */
+    return NULL;
+}
+int main(void) {
+    cur = &main_a; back = &main_a;
+    f1 = mk(body, NULL);
+    sw(f1); sw(f1);
+    pthread_t t; pthread_create(&t, NULL, second, NULL); pthread_join(t, NULL);
+    int ok = steps == 3 && ran_on[0] == syscall(SYS_gettid) && ran_on[2] == tid_b && aligned_ok;
+    printf("fiber switch: %d steps, thread follows the resuming thread: %s, aligned %d -> %s\n", steps,
+           ran_on[2] == tid_b ? "yes" : "no", aligned_ok, ok ? "OK" : "FAILED");
+    return !ok;
+}

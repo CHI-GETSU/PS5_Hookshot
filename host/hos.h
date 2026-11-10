@@ -42,8 +42,19 @@
 
 #define HOS_SYSTEM_BASE 0x01000000ULL
 #define HOS_SYSTEM_END 0x07000000ULL
+#ifdef __PROSPERO__
+#define HOS_HEAP_BASE 0x400000000ULL   /* (PS5: 16 GiB, inside the 64 GiB window) */
+#else
 #define HOS_HEAP_BASE 0x1000000000ULL
+#endif
+#ifdef __PROSPERO__
+/* (PS5) 64 GiB of the 39-bit space: the window sits at A64_HOST_BASE = 64 GiB and ends where the platform layer's heap
+   reserves its 16 GiB (128 GiB, PS5_HEAP_HINT; Mesa's device memory follows at 256 GiB: host/ps5/win32_ps5.h). The guest's
+   heap starts at 16 GiB instead of 64 (HOS_HEAP_BASE below), its address regions come down from 64 GiB */
+#define HOS_GUEST_SPACE 0x1000000000ULL
+#else
 #define HOS_GUEST_SPACE (1ULL << 39)
+#endif
 extern const uint64_t hos_image_base, hos_image_end;   /* (gen/hos_image.c) */
 extern const uint64_t hos_program_id;                  /* (gen/hos_image.c: main.npdm's) */
 extern const char hos_main_build_id[];                 /* (gen/hos_image.c: main's NSO build id, hex) */
@@ -65,7 +76,7 @@ void web_mark_written(const void *p, size_t n);   /* (hos/web/win32.c: guest mem
 extern uint64_t hos_space_end;   /* web: the guest window ends where the host's own data starts (hos_main.c) */
 #define HOS_SPACE_END hos_space_end
 #else
-#define HOS_SPACE_END 0x8000000000ULL
+#define HOS_SPACE_END HOS_GUEST_SPACE
 #endif
 /* (hookshot) host pointer of the n guest bytes at a, NULL unless all of them lie in the guest window. For addresses
    and sizes host code takes from guest memory or arguments before it reads or writes there: GP alone wraps around

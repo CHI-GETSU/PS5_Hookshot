@@ -37,3 +37,7 @@ build-linux/
 
 # ---- NVIDIA's DLSS SDK (scripts/ngx_sdk.py): NVIDIA's files, never committed ----
 ngx-sdk/
+
+# ---- the PS5 title folder: image.bin is made from the game ----
+dist/
+.local/

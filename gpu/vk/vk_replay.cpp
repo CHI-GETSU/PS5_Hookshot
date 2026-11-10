@@ -2443,6 +2443,10 @@ void write_png(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h) {
     for (int i = 3; i >= 0; i--) z.push_back((uint8_t)(adler >> (i * 8)));
     FILE* f = fopen(path, "wb");
     if (!f) return;
+#ifdef __PROSPERO__
+    std::vector<char> whole(z.size() + 4096);   // (PS5: one write for the file; each write to the title folder costs ~60 ms)
+    setvbuf(f, whole.data(), _IOFBF, whole.size());
+#endif
     auto be32 = [&](uint32_t v) { uint8_t q[4] = {(uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v}; fwrite(q, 1, 4, f); };
     auto chunk = [&](const char* type, const uint8_t* d, size_t n) {
         be32((uint32_t)n);
@@ -2759,6 +2763,49 @@ void do_present(const nvn_tex* t, const int crop[4]) {
                     if (end == q + 1) break;
                     if (const uint64_t g = host->gpu_guest(a)) host->watch_guest_writes(g & ~4095ull, 4096);
                     q = *end ? end : nullptr;
+                }
+            }
+        }
+        {   // (PS5_Hookshot, diagnostics) RX_VK_PEEK=<gpu address>[,...] (hex): at each present, the first word at each of those
+            // addresses as the game's memory holds it, logged whenever one of them changed (2000 lines): where the GPU writes the
+            // game's memory in place (no mirror), a GPU-written count followed frame by frame, from a scene's first one
+            static const char* e = getenv("RX_VK_PEEK");
+            if (e) {
+                static std::vector<uint64_t> at;
+                static std::vector<uint32_t> last;
+                static int lines;
+                if (at.empty()) {
+                    for (const char* q = e; *q;) {
+                        char* end;
+                        const uint64_t a = strtoull(q, &end, 16);
+                        if (end == q) break;
+                        at.push_back(a), q = *end ? end + 1 : end;
+                    }
+                    last.assign(at.size(), 0xFFFFFFFFu);
+                }
+                std::vector<uint32_t> now(at.size(), 0);
+                for (size_t i = 0; i < at.size(); i++) host->gpu_read(at[i], &now[i], 4);
+                if (now != last && lines < 2000) {
+                    lines++;
+                    std::string t;
+                    char w[32];
+                    for (const uint32_t v : now) snprintf(w, sizeof w, " %u", v), t += w;
+                    logf("vk: peek at present %lld:%s", (long long)presents, t.c_str());
+                    last = now;
+                }
+            }
+        }
+        {   // (PS5_Hookshot, diagnostics) RX_VK_POKE=<gpu address>[,...] (hex): at each present the GPU writes the present's number
+            // at each of those addresses (a fill of 4 bytes in the frame's last recording): with RX_VK_PEEK on the same addresses,
+            // whether what the GPU writes into the game's memory there arrives
+            static const char* e = getenv("RX_VK_POKE");
+            if (e) {
+                for (const char* q = e; *q;) {
+                    char* end;
+                    const uint64_t a = strtoull(q, &end, 16);
+                    if (end == q) break;
+                    q = *end ? end + 1 : end;
+                    if (const BufferRef b = gpu_buffer_bind(a, 4, true)) vkCmdFillBuffer(r.cmd, b.buffer, b.offset, 4, (uint32_t)presents);
                 }
             }
         }

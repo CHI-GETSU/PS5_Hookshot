@@ -971,6 +971,17 @@ FILE* disk_in = nullptr;
 std::string disk_path;   // (hookshot_programs.bin: the precompile opens it once a thread)
 std::unordered_map<uint64_t, std::vector<DiskRecord>> disk_records;
 FILE* disk_out = nullptr;
+// (PS5_Hookshot) The records of a preparation are held and written 8 MB at a time. Each write call into the console's title
+// folder costs ~60 ms whatever its size (24 MB go in 1.4 s), and a record went out in the C library's 4 KB pieces with a flush
+// after it and another after its index entry: ~1.5 s a program under the lock, every worker waiting (1.2 programs a second on
+// eight cores at 10% of one). In play each record is still written at once, in one piece. Elsewhere nothing is held.
+#ifdef __PROSPERO__
+constexpr size_t kDiskHold = 8u << 20;
+#else
+constexpr size_t kDiskHold = 0;
+#endif
+size_t disk_held = 0;   // (bytes written to disk_out and not flushed: disk_mu)
+int64_t disk_end = -1;   // (where the next record goes in the file: asked once, counted from then on)
 // (the records' heads, in the file's order, in hookshot_programs.idx beside it: see disk_init)
 FILE* disk_idx = nullptr;
 bool disk_listing = false;
@@ -1017,6 +1028,9 @@ uint64_t disk_stamp() {
     // (and a GPU's mesh shaders: a file of native task and mesh programs is no use to the compute fallback, nor its to one)
     const uint32_t mesh = (dev.mesh_shader ? 1u : 0u) | (dev.mesh_fallback ? 2u : 0u);
     add(&mesh, sizeof mesh);
+    // (PS5_Hookshot) and the storage buffers' offset alignment the programs were translated for, when it is not the usual 4 (so
+    // the caches there are stay): a program takes the rest of an address by it
+    if (const uint32_t ssbo_align = (uint32_t)dev.props.limits.minStorageBufferOffsetAlignment; ssbo_align > 4) add(&ssbo_align, sizeof ssbo_align);
     // (the records keep Shader::Info as it lies in memory: a cache written by another C++ library (the MSVC build's, then the
     // llvm-mingw one's libc++) has other layouts, and reading it crashed at start. The library and the sizes, so it starts again)
     const uint32_t abi[] = {(uint32_t)sizeof(Shader::Info), (uint32_t)sizeof(Program), (uint32_t)sizeof(std::vector<uint32_t>),
@@ -1179,6 +1193,9 @@ void disk_init() {
             if (idx_whole) disk_idx = fopen(idx_path.c_str(), "ab");
             else idx_write(idx_path, stamp, order);
         }
+        // (PS5: no setvbuf here. A 9 MiB stream buffer asked of the console's libc (setvbuf with no buffer of ours) left every
+        // guest thread started afterwards without its thread-local data: the game crashed 7 s into each start, at the first
+        // nn::os::SetTlsValue of a new thread. Records are held by not flushing instead: kDiskHold)
         disk_in = disk_out ? fopen(path.c_str(), "rb") : nullptr;
         disk_path = path;
         disk_on = disk_out != nullptr && disk_in != nullptr;
@@ -1300,6 +1317,15 @@ void get_info(Reader& r, Shader::Info& i) {
     for (auto& h : i.handle_programs) r.list(h);
 }
 
+void disk_flush_locked() {   // (the records before their index entries: disk_mu held)
+    if (disk_out) fflush(disk_out);
+    if (disk_idx) fflush(disk_idx);
+    disk_held = 0;
+}
+void program_cache_flush() {
+    std::lock_guard lk(disk_mu);
+    if (disk_held) disk_flush_locked();
+}
 void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t>>& spirv) {
     disk_init();
     if (!disk_on || spirv.size() != p.stages.size()) return;
@@ -1316,18 +1342,42 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
         put_info(o, st.info);
     }
     const uint64_t head[2] = {p.key, o.size()};
+    const auto save_t0 = std::chrono::steady_clock::now();
     std::lock_guard lk(disk_mu);
-    _fseeki64(disk_out, 0, SEEK_END);
-    const int64_t at = _ftelli64(disk_out);
+    const auto save_t1 = std::chrono::steady_clock::now();
+    struct SaveTimes {   // (what keeping a program costs: the wait for the file's lock and the write, every 2000 records)
+        std::chrono::steady_clock::time_point t0, t1;
+        ~SaveTimes() {
+            static double wait_ms, write_ms;
+            static int n;
+            const auto t2 = std::chrono::steady_clock::now();
+            wait_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            write_ms += std::chrono::duration<double, std::milli>(t2 - t1).count();
+            if (++n % 2000 == 0) {
+                logf("vk: program cache: 2000 records kept, %.0f ms waiting for the file and %.0f ms writing", wait_ms, write_ms);
+                wait_ms = write_ms = 0;
+            }
+        }
+    } save_times{save_t0, save_t1};
+    // (the record's place counted, not asked for where records are held: a seek writes what the stream holds, a write call a
+    // record again: kDiskHold)
+    if (!kDiskHold || disk_end < 0) {
+        _fseeki64(disk_out, 0, SEEK_END);
+        disk_end = _ftelli64(disk_out);
+    }
+    const int64_t at = disk_end;
     fwrite(head, 8, 2, disk_out);
     fwrite(o.data(), 1, o.size(), disk_out);
-    fflush(disk_out);
+    disk_end += 16 + (int64_t)o.size();
+    const bool hold = kDiskHold && disk_listing;   // (a preparation's: see kDiskHold)
+    if (!hold) fflush(disk_out);
     if (disk_idx) {   // (after the record: an index ahead of the file would name a record it does not have)
         std::vector<uint8_t> e;
         idx_put(e, p.key, o.size(), *(const uint32_t*)o.data());
         fwrite(e.data(), 1, e.size(), disk_idx);
-        fflush(disk_idx);
+        if (!hold) fflush(disk_idx);
     }
+    if (hold && (disk_held += o.size() + 16) >= kDiskHold) disk_flush_locked();
     // (the precompile's: nothing holds them but the file, and the game starts on them at once)
     if (disk_listing) disk_records[p.key].push_back({at + 16, o.size(), (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | (p.fallback ? 4 : 0))});
 }
@@ -1335,6 +1385,7 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
 /// The kept variants of key read from the file (in: a handle on it, used under mu when given) and made ready, to variants
 void program_cache_read(FILE* in, std::mutex* mu, uint64_t key, const std::vector<DiskRecord>& recs,
                         std::vector<std::unique_ptr<Program>>& variants) {
+    program_cache_flush();   // (a record still held is not in the file to read: kDiskHold)
     for (const DiskRecord& d : recs) {
         std::vector<uint8_t> data(16 + d.size);   // (with its head, the key and size: the index's word is checked against the file's)
         {
@@ -2216,6 +2267,7 @@ void program_cache_each(const std::function<void(const KeptProgram&)>& fn) {
                 if (!(d.kind & 1)) all.push_back({kv.first, d});
     }
     std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.second.at < b.second.at; });   // (file order)
+    program_cache_flush();
     KeptProgram k;
     for (const auto& [key, d] : all) {
         std::vector<uint8_t> data(d.size);
@@ -2334,6 +2386,7 @@ size_t seed_open() {
 
 void seed_close() {
     seed = Seed{};
+    program_cache_flush();   // (what the preparation still holds: kDiskHold)
     disk_listing = false;
 }
 
