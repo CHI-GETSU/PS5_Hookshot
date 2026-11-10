@@ -40,6 +40,7 @@ int pthread_setname_np(pthread_t thread, const char *name);   /* (host/ps5/win32
 
 /* dlopen and dlsym over the libraries linked in: "hookshot_vk.dll" is the Vulkan back end, "vulkan-1.dll" RADV, and
    RTLD_DEFAULT the executable's own symbols that the Linux build finds across its .so boundary */
+const char *hos_ps5_nup(void);   /* (the game's package on the console: host/ps5/win32_ps5.c) */
 void *hos_ps5_dlopen(const char *path, int mode);
 void *hos_ps5_dlsym(void *module, const char *name);
 int hos_ps5_dlclose(void *module);

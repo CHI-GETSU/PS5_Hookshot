@@ -18,7 +18,7 @@ as a native PS5 title, **PPSA99024**, on my homebrew stack: Mesa's RADV from
 | Lift | The game's ARM64 code to C, from your `.nup`, as upstream does it | `nx2/nup.py --only exefs`, `nx2/lift.py --standalone --write` |
 | Compile | The lifted game, `host/` and `gpu/vk` for `x86_64-sie-ps5` (Zen 2) | `ps5/build.py` |
 | Link | One executable with RADV linked in, signed as the console's fake SELF | `ps5/tools/link.sh` (PS5_VulkanTemplate's link) |
-| Install | `dist/PPSA99024` to `/data/homebrew/PPSA99024`; `romfs/` is read in place from your `.nup` on the console (`HOS_PS5_NUP`, default `/data/prosperoeden/roms/oot/oot.nup`) | FTP, `host/ps5/nup_romfs.c` |
+| Install | `dist/PPSA99024` to `/data/homebrew/PPSA99024`; `romfs/` is read in place from your `.nup` on the console (`HOS_PS5_NUP`, else `/data/lichii/roms/oot/oot.nup`, else `/data/prosperoeden/roms/oot/oot.nup`) | FTP, `host/ps5/nup_romfs.c` |
 
 One command does all of it on a Linux PC, from a fresh checkout, and on Windows through Ubuntu under WSL 2
 (`ps5/build-windows.bat`, which runs it there):

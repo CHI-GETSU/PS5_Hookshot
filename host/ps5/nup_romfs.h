@@ -1,5 +1,5 @@
 /* PS5: the game's romfs read in place from its .nup package (host/ps5/nup_romfs.c), so the console needs no 26 GB
-   extracted copy: the package ProsperoEden already reads (/data/prosperoeden/roms/oot/oot.nup) serves both.
+   extracted copy: the package an emulator on the console already reads (hos_ps5_nup, host/ps5/win32_ps5.c) serves both.
    host/posix/win32_posix.c's file calls send every path under NUP_ROMFS_ROOT here. */
 #ifndef HOS_NUP_ROMFS_H
 #define HOS_NUP_ROMFS_H

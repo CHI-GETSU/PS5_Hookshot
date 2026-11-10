@@ -232,7 +232,7 @@ Built: $title ($(du -sh -- "$title" | cut -f1))
 
 On the console, with its homebrew environment running and an FTP server on (port 2121 with ftpsrv):
   1. Copy the whole PPSA99024 folder to /data/homebrew/PPSA99024.
-  2. Copy your game file to /data/prosperoeden/roms/oot/oot.nup (make the folders; the name must be oot.nup).
+  2. Copy your game file to /data/lichii/roms/oot/oot.nup (make the folders; the name must be oot.nup).
   3. Start Hookshot from the home screen (ShadowMountPlus puts it there), or from your homebrew launcher.
 image.bin and eboot.bin in that folder are made from your game: keep them on your PC and your console.
 EOF

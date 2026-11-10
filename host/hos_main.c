@@ -1394,12 +1394,12 @@ static int game_main(int argc, char **argv) {
                 if (!hos_romfs_dir) hos_romfs_dir = beside_romfs;
 #ifdef __PROSPERO__
                 /* (PS5) the title folder (/app0) holds image.bin and the saves; the romfs is read in place from the game's
-                   .nup (HOS_PS5_NUP, else the package ProsperoEden reads), and from a romfs/ folder beside image.bin only
-                   when there is no package */
+                   .nup (hos_ps5_nup: HOS_PS5_NUP, else the package an emulator there reads), and from a romfs/ folder
+                   beside image.bin only when there is no package */
                 if (hos_romfs_dir == beside_romfs) {
                     int nup_romfs_open(const char *package);
-                    const char *nup = getenv("HOS_PS5_NUP");
-                    if (nup_romfs_open(nup && *nup ? nup : "/data/prosperoeden/roms/oot/oot.nup")) hos_romfs_dir = "/nup/romfs";
+                    const char *hos_ps5_nup(void);
+                    if (nup_romfs_open(hos_ps5_nup())) hos_romfs_dir = "/nup/romfs";
                 }
                 if (!hos_user_dir) hos_user_dir = beside_user;
 #elif !defined(_WIN32)

@@ -712,10 +712,20 @@ static void *file_probe_open(void *unused) {
     }
     return NULL;
 }
+/* The game's package on the console: HOS_PS5_NUP, else the copy an emulator there already keeps, so one 25 GB file serves
+   both: PS5_Lichii's folder, then the one it had before 2026-11-10 (when neither is there, the first, for the message). */
+const char *hos_ps5_nup(void) {
+    static const char *const places[] = {"/data/lichii/roms/oot/oot.nup", "/data/prosperoeden/roms/oot/oot.nup"};
+    const char *set = getenv("HOS_PS5_NUP");
+    if (set && *set) return set;
+    for (size_t i = 0; i < sizeof places / sizeof *places; i++)
+        if (access(places[i], R_OK) == 0) return places[i];
+    return places[0];
+}
 static double file_probe_read_gap;
 static void *file_probe_read(void *unused) {   /* (the game's own reads: 64 KiB pieces of its package, here and there) */
     (void)unused;
-    const char *nup = getenv("HOS_PS5_NUP") ? getenv("HOS_PS5_NUP") : "/data/prosperoeden/roms/oot/oot.nup";
+    const char *nup = hos_ps5_nup();
     FILE *f = fopen(nup, "rb");
     if (!f) return NULL;
     static char piece[65536];
