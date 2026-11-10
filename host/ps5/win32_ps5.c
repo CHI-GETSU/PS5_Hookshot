@@ -1147,10 +1147,30 @@ static void *cpu_meter(void *unused) {
             pthread_mutex_lock(&window_lock);
             const uint64_t kept = (uint64_t)free_count * UNIT, ahead = (uint64_t)(block_end - block_next);
             pthread_mutex_unlock(&window_lock);
-            fprintf(stderr, "[ps5] direct memory: %llu MiB taken, %llu free in %llu pieces; the guest window keeps %llu MiB of "
-                    "decommitted units and %llu MiB of its block unused\n", (unsigned long long)((total - room) >> 20),
-                    (unsigned long long)(room >> 20), (unsigned long long)pieces, (unsigned long long)(kept >> 20),
-                    (unsigned long long)(ahead >> 20));
+            extern uint64_t radv_ps5_allocated_bytes;   /* (the driver's buffers, all of them: its winsys counts them) */
+            fprintf(stderr, "[ps5] direct memory: %llu MiB taken, %llu free in %llu pieces; the driver's buffers %llu MiB; the guest "
+                    "window keeps %llu MiB of decommitted units and %llu MiB of its block unused\n",
+                    (unsigned long long)((total - room) >> 20), (unsigned long long)(room >> 20), (unsigned long long)pieces,
+                    (unsigned long long)(__atomic_load_n(&radv_ps5_allocated_bytes, __ATOMIC_RELAXED) >> 20),
+                    (unsigned long long)(kept >> 20), (unsigned long long)(ahead >> 20));
+            /* (a driver built with its buffers counted by purpose and size, for diagnosis: PS5_Mesa's radv_ps5_bo.c) */
+            extern uint64_t radv_ps5_account_bytes[6][3] __attribute__((weak)), radv_ps5_account_count[6][3] __attribute__((weak));
+            if (radv_ps5_account_bytes) {
+                static const char *const rows[6] = {"application", "queries", "descriptor pools", "uploads and fences",
+                                                    "shader code and scratch", "command streams"};
+                char line[640];
+                int n = 0;
+                for (int r = 0; r < 6; r++)
+                    n += snprintf(line + n, sizeof line - n, "; %s %llu MiB (%llu+%llu+%llu in %llu+%llu+%llu)", rows[r],
+                                  (unsigned long long)((radv_ps5_account_bytes[r][0] + radv_ps5_account_bytes[r][1] +
+                                                        radv_ps5_account_bytes[r][2]) >> 20),
+                                  (unsigned long long)(radv_ps5_account_bytes[r][0] >> 20),
+                                  (unsigned long long)(radv_ps5_account_bytes[r][1] >> 20),
+                                  (unsigned long long)(radv_ps5_account_bytes[r][2] >> 20),
+                                  (unsigned long long)radv_ps5_account_count[r][0], (unsigned long long)radv_ps5_account_count[r][1],
+                                  (unsigned long long)radv_ps5_account_count[r][2]);
+                fprintf(stderr, "[ps5] driver buffers by purpose (under 1 MiB + under 16 + larger)%s\n", line);
+            }
         }
         fprintf(stderr, "[ps5] cpu: %.0f%% of one core (user %.0f%%, system %.0f%%) over %.1f s; guest pages %llu MiB; heap %llu MiB "
                 "(peak %llu); stacks %lld MiB in %lld; direct memory %lld MiB, largest free piece %llu MiB\n",
