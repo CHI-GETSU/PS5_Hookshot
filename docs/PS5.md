@@ -89,7 +89,9 @@ The same lift builds for the PC (`RX_CPM=.local/ps5-deps/cpm OOT_WORK=work/lift 
 `RX_VK_MIRROR=0` there is the console's path (the game's memory read in place). The switches that found the foliage fault, on
 both: `RX_VK_FLASH=1` (one-frame flashes counted), `RX_VK_PEEK=<gpu addresses>` (a word followed frame by frame),
 `RX_VK_LOG_PROGS_AT=<from>:<to>` (every compute dispatch of those frames), `RX_VK_DRAW_STATS_ON=<program>` (the statistics
-capture armed by a program's first dispatch), `RX_VK_DRAW_STATS_ADDRS`, and on the console `RX_VK_DRAW_STATS_NO_QUERY=1`.
+capture armed by a program's first dispatch) and `RX_VK_DRAW_STATS_ADDRS`. The capture counts task and mesh shader
+invocations only where the driver offers them (`meshShaderQueries`): RADV does not on the console, and a query pool made with
+those counts all the same hung the GPU at the first capture.
 
 ## Frame generation
 
@@ -113,8 +115,6 @@ console (`RX_VK_FSR_FG=0`). PS5_MihawkGen is GPL-3.0-or-later, as this repositor
 - **`setvbuf` with a large buffer.** After `setvbuf(stream, NULL, _IOFBF, 9 MiB)` every thread started later had no
   thread-local data, and the game crashed 7 s into each start. The renderer asks for no stream buffer of its own on the
   console (gpu/vk/vk_shader.cpp).
-- **Pipeline statistics queries** that hold a task or mesh draw never become available: `vkGetQueryPoolResults` with
-  `VK_QUERY_RESULT_WAIT_BIT` hung the title.
 - `pthread_getaffinity_np` / `pthread_setaffinity_np` do nothing; `scePthreadGetaffinity` / `scePthreadSetaffinity` are used.
 
 ## Known gaps

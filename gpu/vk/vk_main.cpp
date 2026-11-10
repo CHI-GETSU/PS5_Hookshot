@@ -428,6 +428,9 @@ bool create_device() {
     }
     mesh.multiviewMeshShader = mesh.primitiveFragmentShadingRateMeshShader = VK_FALSE;   // (not used)
     dev.mesh_shader = dev.mesh_shader && mesh.meshShader && mesh.taskShader;
+    // (task and mesh shader counts in pipeline statistics, a feature of their own: RADV has it off on RDNA2 and on the PS5,
+    // where a query pool made with those counts all the same hung the GPU at its first query)
+    dev.mesh_queries = dev.mesh_shader && mesh.meshShaderQueries;
     // (hookshot, issue 640) RDNA1 and older GPUs: no mesh shaders, but task and mesh programs run as compute shaders
     // that write their vertices to buffers, drawn through an ordinary graphics pipeline. It needs buffer device addresses.
     dev.mesh_fallback = !dev.mesh_shader && f12.bufferDeviceAddress && !getenv("RX_VK_NO_MESH_FALLBACK");

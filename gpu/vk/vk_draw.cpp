@@ -4463,13 +4463,6 @@ const char* stats_dir() {
     static const char* d = getenv("RX_VK_DRAW_STATS");
     return d && *d ? d : nullptr;
 }
-/// (PS5_Hookshot) RX_VK_DRAW_STATS_NO_QUERY=1: the capture without its pipeline statistics queries (every count 0): the PS5's RADV
-/// never answers one that holds a task or mesh draw, and the title hung at the first capture. The arguments as the GPU held them,
-/// the bindings and the buffer dumps are still written
-bool stats_no_query() {
-    static const bool v = getenv("RX_VK_DRAW_STATS_NO_QUERY") != nullptr;
-    return v;
-}
 bool stats_frame_now() {
     if (!stats_dir()) return false;
     const int64_t at = stats_frame.load(std::memory_order_relaxed);
@@ -4485,7 +4478,7 @@ bool stats_make_pool() {
                                                VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT |
                                                VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT;
     qi.pipelineStatistics = base;
-    if (dev.mesh_shader) {
+    if (dev.mesh_queries) {   // (not dev.mesh_shader: see where it is set)
         qi.pipelineStatistics = base | VK_QUERY_PIPELINE_STATISTIC_TASK_SHADER_INVOCATIONS_BIT_EXT |
                                 VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT;
         if (vkCreateQueryPool(dev.device, &qi, nullptr, &stats_pool) == VK_SUCCESS) {
@@ -4574,7 +4567,7 @@ void stats_tick() {
     const uint32_t n = std::min(stats_used.load(), kStatsQueries);
     const uint32_t words = stats_mesh_bits ? 7 : 5;   // (in bit order: vs, clip in, clip out, fs, cs, [task, mesh])
     std::vector<uint64_t> r((size_t)n * words);
-    VkResult res = n && !stats_no_query() ? vkGetQueryPoolResults(dev.device, stats_pool, 0, n, r.size() * 8, r.data(), (VkDeviceSize)words * 8,
+    VkResult res = n ? vkGetQueryPoolResults(dev.device, stats_pool, 0, n, r.size() * 8, r.data(), (VkDeviceSize)words * 8,
                                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT)
                      : VK_SUCCESS;
     struct Sum {
@@ -4872,7 +4865,7 @@ struct StatsQuery {
         own = d;
         is_dispatch = dispatch;
         if (dispatch) copy_args(c, own, i);   // (before the dispatch: outside any pass already)
-        if (!stats_no_query()) vkCmdBeginQuery(c, stats_pool, i, 0);
+        vkCmdBeginQuery(c, stats_pool, i, 0);
         cmd = c, index = i;
     }
     bool is_dispatch = false;
@@ -4880,7 +4873,7 @@ struct StatsQuery {
     uint64_t prog = 0;
     ~StatsQuery() {
         if (!cmd) return;
-        if (!stats_no_query()) vkCmdEndQuery(cmd, stats_pool, index);
+        vkCmdEndQuery(cmd, stats_pool, index);
         if (!is_dispatch) copy_args(cmd, *draw, index);   // (a dispatch's were copied before it ran: begin)
         if (is_dispatch) copy_watch(cmd, index);
         if (state) gpu_dump(cmd, *state, prog, is_dispatch);
