@@ -163,7 +163,7 @@ static int commit_units(uintptr_t lo, uintptr_t hi) {
 
 /* commit_units, waiting for memory when there is none: the game gives an area's pages back while it loads the next (leaving
    Hyrule Castle Town a worker's page found none with 85 MiB free, and the game was gone), the renderer's emptied blocks and
-   the heap's free segments go back too. Tried again for up to 3 s before the caller is told no; window_lock held on
+   the heap's free segments go back too. Tried again for up to 10 s before the caller is told no; window_lock held on
    entry and on return, not while waiting */
 static int commit_units_wait(uintptr_t lo, uintptr_t hi) {
     for (int tries = 0;; tries++) {
@@ -171,10 +171,10 @@ static int commit_units_wait(uintptr_t lo, uintptr_t hi) {
             if (tries) hos_ps5_klog_now("[ps5] guest commit: memory found after %d ms", tries * 20);
             return 1;
         }
-        if (!tries || tries == 150)
+        if (!tries || tries == 500)
             hos_ps5_klog_now("[ps5] guest commit: no direct memory left (%llu MiB committed)%s",
                              (unsigned long long)(committed_bytes >> 20), tries ? "" : ": waiting for some");
-        if (tries == 150) return 0;
+        if (tries == 500) return 0;
         pthread_mutex_unlock(&window_lock);
 #ifdef PS5_HEAP_TRIM
         if (!tries) ps5_heap_trim();

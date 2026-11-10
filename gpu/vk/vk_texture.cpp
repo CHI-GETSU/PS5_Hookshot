@@ -3501,6 +3501,19 @@ void texture_frame(uint64_t completed) {
         const uint64_t over = used - allowed / 100 * 97;
         budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
     }
+#ifdef __PROSPERO__
+    // (PS5) the game's pages come from the same pool as the textures: with less than the reserve free, every texture unused
+    // for a second goes, not only what is over the renderer's own share. Leaving Hyrule Castle Town the town's 1.25 GB of
+    // textures waited their turn under a loading screen while the game's next page found no memory
+    static std::atomic<uint64_t> ps5_shed_frames{0};
+    if (hos_ps5_direct_room() < ps5_tex_reserve()) {
+        budget = 0;
+        const uint64_t n = ++ps5_shed_frames;
+        if (n == 1 || n % 600 == 0)
+            logf("vk: memory short (%llu MB free): textures unused for a second go (%llu frames of it so far)",
+                 (unsigned long long)(hos_ps5_direct_room() >> 20), (unsigned long long)n);
+    }
+#endif
     if (frame_no % 600 == 0) {
         vma_log_heaps();
         vma_log_image_blocks();

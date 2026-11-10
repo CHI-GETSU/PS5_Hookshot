@@ -85,9 +85,10 @@ together.
       fail to translate for want of memory. The heap gives back what a burst of shader compiles took (PS5_PayloadSDK 55a2de0: 2.0 GB
       mapped after a start that compiles every pipeline, where it stayed at 3.4 with 0.7 in use). Images come from 32 MB
       blocks and the recordings' descriptor pools are an eighth of upstream's (`RX_VK_DESC_POOL_DIV=8`): the town's lowest
-      free memory went from 558 to 911 MiB at the same frame rate. A game page that finds no memory waits up to 3 s for
-      some to come back. Still open: a save that holds 8.3 GB of game pages in the town ran out leaving it (before these
-      changes); the mesh shaders' scratch ring (320 MiB) and textures other than ASTC are not yet made smaller for it
+      free memory went from 558 to 911 MiB at the same frame rate. With less than 1 GB free every texture unused for a
+      second goes, and a game page that finds no memory waits up to 10 s for some to come back. Still open: a save that
+      holds 8.3 GB of game pages in the town ran out leaving it, at 8.8 GB, with the first of these changes; the mesh
+      shaders' scratch ring (320 MiB) and textures other than ASTC are not yet made smaller for it
 
 Local `main` is upstream's `main` of 2026-11-10 (2877284, past v2.0.14's line) with PR #1438 (AMD resolve keys, image fallback past VMA's budget) and RufflezAU's
 Steam Deck texture eviction by age in milliseconds (`RX_VK_EVICT_MIN_MS`, 1000; read once a present here, not at each touch).
