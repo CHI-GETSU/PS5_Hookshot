@@ -82,7 +82,8 @@ together.
 - [ ] A scene's first frames: 0.3-0.6 s, 3 s where its shaders are met for the first time
 - [ ] Memory: Hyrule Castle Town ran out on arrival with textures of up to 1024 texels (two runs of three); the console's
       default is 512 (`RX_VK_TEX_MAX_DIM`), where the town plays with 180-500 MiB of 13.2 GB free and a few shaders still
-      fail to translate for want of memory
+      fail to translate for want of memory. The heap gives back what a burst of shader compiles took (PS5_PayloadSDK 55a2de0: 2.0 GB
+      mapped after a start that compiles every pipeline, where it stayed at 3.4 with 0.7 in use)
 
 Local `main` is upstream's `main` of 2026-11-10 (2877284, past v2.0.14's line) with PR #1438 (AMD resolve keys, image fallback past VMA's budget) and RufflezAU's
 Steam Deck texture eviction by age in milliseconds (`RX_VK_EVICT_MIN_MS`, 1000; read once a present here, not at each touch).

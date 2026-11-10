@@ -9,7 +9,7 @@ What it builds from (docs/PS5.md has the whole route):
   - gpu/vk with Eden's shader recompiler, linked in rather than loaded (no dynamic loading on the console);
   - Mesa's RADV from PS5_Vulkan (its release archive and link recipe), the payload SDK fork's platform layer.
 
-Paths: OOT_WORK (default work/lift), PS5_PAYLOAD_SDK (default ../PS5_VulkanTemplate's pinned SDK), PS5_VULKAN
+Paths: OOT_WORK (default work/lift), PS5_PAYLOAD_SDK (default .local/ps5-deps/ps5-payload-sdk, else ../PS5_VulkanTemplate's), PS5_VULKAN
 (default ../PS5_Vulkan). Objects are kept by a key of their flags, source and headers: a rebuild compiles what changed.
 """
 import argparse
@@ -31,7 +31,10 @@ import logo_rgba  # noqa: E402
 import ui_fonts   # noqa: E402  (the overlays' bundled fonts, compiled in)
 import version   # noqa: E402
 
-SDK = os.environ.get("PS5_PAYLOAD_SDK", os.path.join(ROOT, "..", "PS5_VulkanTemplate", ".deps", "native", "ps5-payload-sdk"))
+# (the SDK ps5/build-title.sh installs at its pinned revision; before it did, PS5_VulkanTemplate's)
+SDK = os.environ.get("PS5_PAYLOAD_SDK") or next(
+    (d for d in (os.path.join(ROOT, ".local", "ps5-deps", "ps5-payload-sdk"),) if os.path.exists(os.path.join(d, "bin", "prospero-lld"))),
+    os.path.join(ROOT, "..", "PS5_VulkanTemplate", ".deps", "native", "ps5-payload-sdk"))
 VULKAN = os.environ.get("PS5_VULKAN", os.path.join(ROOT, "..", "PS5_Vulkan"))
 DEPS = os.path.join(ROOT, ".local", "ps5-deps")
 CPM = os.path.join(DEPS, "cpm")

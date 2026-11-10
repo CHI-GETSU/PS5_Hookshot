@@ -641,9 +641,25 @@ static void *quit_watch(void *unused) {
     }
     return NULL;
 }
+#ifdef PS5_HEAP_TRIM
+/* The heap's free memory goes back to the title's pool every 10 s (the platform heap gives its pieces back only whole, and
+   only when asked or every few thousand frees): what a burst of shader compiles took is the game's again soon after.
+   Not more often: every 2 s, an area loading mapped and unmapped the same memory again and again (23 fps for 27). */
+static void *heap_trim_loop(void *unused) {
+    (void)unused;
+    for (;;) {
+        sceKernelUsleep(10000000);
+        ps5_heap_trim();
+    }
+    return NULL;
+}
+#endif
 void hos_ps5_quit_watch(void) {
     pthread_t t;
     if (pthread_create(&t, NULL, quit_watch, NULL) == 0) pthread_detach(t);
+#ifdef PS5_HEAP_TRIM
+    if (pthread_create(&t, NULL, heap_trim_loop, NULL) == 0) pthread_detach(t);
+#endif
 }
 
 /* ---- HOS_PS5_TIMING=1: how long the waits the runtime builds on take on the console (each asked for the time named) ---- */
@@ -1172,6 +1188,10 @@ static void *cpu_meter(void *unused) {
                 fprintf(stderr, "[ps5] driver buffers by purpose (under 1 MiB + under 16 + larger)%s\n", line);
             }
         }
+#ifdef PS5_HEAP_TRIM   /* (a platform heap that counts what its arenas hold in blocks handed out: PS5_PayloadSDK 55a2de0) */
+        fprintf(stderr, "[ps5] heap: %llu MiB mapped in %u segments, %llu MiB of it in blocks in use, %u arenas\n",
+                (unsigned long long)(heap.mapped_bytes >> 20), heap.segments, (unsigned long long)(heap.in_use_bytes >> 20), heap.arenas);
+#endif
         fprintf(stderr, "[ps5] cpu: %.0f%% of one core (user %.0f%%, system %.0f%%) over %.1f s; guest pages %llu MiB; heap %llu MiB "
                 "(peak %llu); stacks %lld MiB in %lld; direct memory %lld MiB, largest free piece %llu MiB\n",
                 100 * (user + sys) / (t - t0), 100 * user / (t - t0), 100 * sys / (t - t0), (t - t0) / 1e3,
