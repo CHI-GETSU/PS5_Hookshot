@@ -11,7 +11,9 @@ set -euo pipefail
 work=$1 image=$2
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 sdk=${PS5_PAYLOAD_SDK:?} vulkan=${PS5_VULKAN:?} ffmpeg=${PS5_FFMPEG:?}
-archive=${RADV_ARCHIVE:-$vulkan/.deps/native/radv-release/lib/libvulkan_radeon.ps5.a}
+# (the driver: RADV_ARCHIVE, else a build kept in .local/ps5-deps/radv (its REVISION beside it), else PS5_Vulkan's own)
+archive=${RADV_ARCHIVE:-$root/.local/ps5-deps/radv/lib/libvulkan_radeon.ps5.a}
+[[ -f $archive ]] || archive=$vulkan/.deps/native/radv-release/lib/libvulkan_radeon.ps5.a
 export PS5_CLANG=${PS5_CLANG:-$(command -v clang)}
 tool="$vulkan/build/host/ps5-native-tool"
 native="$vulkan/tooling/native"

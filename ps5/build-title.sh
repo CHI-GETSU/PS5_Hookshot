@@ -24,7 +24,7 @@ set -euo pipefail
 
 REF=${HOOKSHOT_REF:-ps5-v0.1.0-beta.1}
 VULKAN_REV=7f492b4c6f67a4e8c8c67a4272cfeef22abea9cc
-MESA_REV=47e9eb61ee7e1112194557e1e047178562827bc6
+MESA_REV=0f86253f674c425052948eb3cb116c81e646a734
 SDK_REV=55a2de04e3364f0a6c8d6c337dc95436cf091ef0
 MIHAWKGEN_REV=c57232a9f16bcb6df5fe07c9bb631518f2b1cc0e
 # (the headers gpu/vk is compiled with: scripts/linux/deps.sh's pins, which ps5/build.py names)

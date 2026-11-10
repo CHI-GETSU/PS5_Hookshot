@@ -90,8 +90,10 @@ together.
       10 s for some to come back. A save that holds 8.3 GB of game pages in the town now leaves it for Hyrule Field,
       and ran out there a minute later with 9.2 GB of game pages (before the images' own memory). `HOS_PS5_ZERO_SCAN=1`
       counts the game's backed 64 KiB units that hold only zeros: ~800 MiB of 7.5 GB in the town, 430 MiB of them
-      backed for the GPU's imports before the game wrote them. Still open: the mesh shaders' scratch ring (320 MiB),
-      the heap's 950 MiB in use, and textures other than ASTC are not yet made smaller for it
+      backed for the GPU's imports before the game wrote them. The mesh shaders' scratch ring is 128 MiB, where
+      it was 320 (PS5_Mesa 0f86253: an entry of 64 KiB, the game's shaders keeping 20 KiB at most). Still open: the
+      same save, left once the town has wholly loaded, ran out at the loading screen with 9.2 GB of game pages (before
+      the smaller ring); the heap's 850 MiB in use, and textures other than ASTC are not yet made smaller for it
 
 Local `main` is upstream's `main` of 2026-11-10 (2877284, past v2.0.14's line) with PR #1438 (AMD resolve keys, image fallback past VMA's budget) and RufflezAU's
 Steam Deck texture eviction by age in milliseconds (`RX_VK_EVICT_MIN_MS`, 1000; read once a present here, not at each touch).
