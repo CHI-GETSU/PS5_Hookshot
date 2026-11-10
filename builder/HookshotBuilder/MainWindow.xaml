@@ -171,6 +171,9 @@
                   </Style>
                 </ComboBox.FocusVisualStyle>
               </ComboBox>
+              <!-- (make_game.py's last step, the game's prepare-shaders run: unticked, the game prepares them at its first start) -->
+              <CheckBox x:Name="PrepareTick" Style="{StaticResource Tick}" Content="Prepare shaders now" IsChecked="True" Margin="0,12,0,0"
+                        ToolTip="Prepares the game's shaders at the end of the build, a few minutes (longer on some GPUs). Unticked, the game prepares them at its first start, behind a black window."/>
             </StackPanel>
           </Grid>
 

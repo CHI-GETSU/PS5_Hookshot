@@ -50,6 +50,35 @@ static class Program
         Require(value.GetProperty("jobs").GetString() == "", "Automatic changed an inherited empty entry.");
     }
 
+    /// The shaders' step: the update's argument from the saved choice (the launcher's Update and the --update start read it, not
+    /// the tick), and what the row says when make_game left the shaders to the first start
+    static void ShaderStepChecks(string root)
+    {
+        var settings = Path.Combine(root, "builder-settings.json");
+        Require(BuilderSettings.PrepareNow(settings), "No saved settings must prepare the shaders, as the tick's default.");
+        File.WriteAllText(settings, "not json");
+        Require(BuilderSettings.PrepareNow(settings), "Unreadable settings must prepare the shaders.");
+        File.WriteAllText(settings, """{"Out":"authored output","PrepareLater":true}""");
+        Require(!BuilderSettings.PrepareNow(settings), "A saved unticked choice must leave the shaders to the first start.");
+        Require(ShaderStep.Args(new List<string> { "--update", "authored game" }, BuilderSettings.PrepareNow(settings))
+                .SequenceEqual(new[] { "--update", "authored game", "--no-prepare-shaders" }), "The update ignored the saved choice.");
+        File.WriteAllText(settings, """{"Out":"authored output","PrepareLater":false}""");
+        Require(ShaderStep.Args(new List<string> { "--update", "authored game" }, BuilderSettings.PrepareNow(settings))
+                .SequenceEqual(new[] { "--update", "authored game" }), "A saved ticked choice must prepare the shaders.");
+
+        Require(ShaderStep.Reason("the shaders were not prepared now (no usable Vulkan here): the game prepares them at its first start")
+                == "no usable Vulkan here", "make_game's not-prepared line was not read.");
+        Require(ShaderStep.Reason("the shaders were not prepared now (\"Prepare shaders now\" is unticked (here)): the game prepares them at its first start")
+                == "\"Prepare shaders now\" is unticked (here)", "A reason with brackets was cut.");
+        Require(ShaderStep.Reason("@@stage shaders Preparing shaders") is null && ShaderStep.Reason("done shaders") is null,
+                "Other lines are not a skipped step.");
+        Require(ShaderStep.Skipped(began: true, reason: null) is null, "Prepared shaders must get their check mark.");
+        Require(ShaderStep.Skipped(began: false, reason: null) is { } none && none.Contains("first start"),
+                "No @@stage shaders (an older make_game, or none ran) must not be a check mark.");
+        Require(ShaderStep.Skipped(began: true, reason: "the game printed nothing for 15 minutes and was stopped") is { } stopped
+                && stopped.Contains("15 minutes"), "A stopped preparation must say why under its row.");
+    }
+
     static async Task Main(string[] args)
     {
         if (args.Length is < 1 or > 2) throw new Exception("Pass the Python executable for the authored child.");
@@ -74,6 +103,7 @@ static class Program
                 return;
             }
 
+            ShaderStepChecks(root);
             Require(BuildWorkers.Choices(4).SequenceEqual(new object[] { BuildWorkers.Automatic, 1, 2, 3, 4 }),
                 "The menu must offer Automatic first and one count per logical processor.");
             Require(BuildWorkers.Choices(0).SequenceEqual(new object[] { BuildWorkers.Automatic, 1 }), "CPU fallback must still offer one worker.");

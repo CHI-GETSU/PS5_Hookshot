@@ -252,23 +252,15 @@ public partial class MainWindow : Window
     void LaunchFolderClick(object sender, RoutedEventArgs e) =>
         Process.Start(new ProcessStartInfo(launchFolder) { UseShellExecute = true });
 
-    // ---- what the player chose last time (the install folder, the game files): builder-settings.json beside the versions ----
-    sealed class BuilderSettings
-    {
-        public string? Out { get; set; }
-        public string? Nup { get; set; }
-        public string? Romfs { get; set; }
-        public string? Exefs { get; set; }
-        public bool Dlss { get; set; }   // (NVIDIA DLSS ticked: NVIDIA's license was accepted)
-    }
+    // ---- what the player chose last time (BuilderSettings.cs): builder-settings.json beside the versions ----
     static string SettingsPath => System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HookshotBuilder", "builder-settings.json");
 
     void ApplySettings()
     {
-        BuilderSettings? s = null;
-        try { s = System.Text.Json.JsonSerializer.Deserialize<BuilderSettings>(File.ReadAllText(SettingsPath)); } catch (Exception) { }
+        var s = BuilderSettings.Load(SettingsPath);
         if (s == null) return;
+        PrepareTick.IsChecked = !s.PrepareLater;
         if (!string.IsNullOrEmpty(s.Out)) OutPath.Text = s.Out;
         DlssTick.IsChecked = s.Dlss;
         if (s.Romfs != null && s.Exefs != null && Directory.Exists(s.Romfs) && File.Exists(System.IO.Path.Combine(s.Exefs, "main")))
@@ -293,7 +285,8 @@ public partial class MainWindow : Window
         try
         {
             var s = new BuilderSettings { Out = OutPath.Text, Nup = romfs == null ? chosenNup : null, Romfs = romfs, Exefs = exefs,
-                                          Dlss = DlssTick.IsChecked == true };
+                                          Dlss = DlssTick.IsChecked == true,
+                                          PrepareLater = PrepareTick.IsChecked != true };
             Directory.CreateDirectory(System.IO.Path.GetDirectoryName(SettingsPath)!);
             File.WriteAllText(SettingsPath, System.Text.Json.JsonSerializer.Serialize(s));
         }
@@ -306,7 +299,7 @@ public partial class MainWindow : Window
         switch (what)
         {
             case "build":
-                MakeRows(update: false);
+                MakeRows(update: false, shaders: true);
                 SetStep(1);
                 ShowPage(BuildPage);
                 rows["read"].Begin(); rows["read"].Done(); rows["read"].Small("Version checked");
@@ -692,7 +685,8 @@ public partial class MainWindow : Window
         else if (chosenNup != null) args.AddRange(new[] { "--nup", chosenNup });
         else return;
         args.AddRange(new[] { "--out", OutPath.Text, "--language", lang.Code });
-        Run(tools, args, dlss: DlssTick.IsChecked == true);
+        prepareNow = PrepareTick.IsChecked == true;
+        Run(tools, ShaderStep.Args(args, prepareNow), dlss: DlssTick.IsChecked == true);
     }
 
     const string DlssLicense =
@@ -719,17 +713,30 @@ public partial class MainWindow : Window
         ("lift", "Translate the game to PC code", "Translate the game to PC code"),
         ("compile", "Compile", "Compile changed files"),
         ("finish", "Put the game together", "Swap in the new game"),
+        (ShaderStep.Id, "Prepare the shaders", "Prepare the shaders"),
     };
-    static readonly Dictionary<string, (double From, double Size)> Weight = new()
+    static readonly Dictionary<string, (double From, double Size)> WithShaders = new()
+    {
+        ["download"] = (0, 0.04), ["read"] = (0.04, 0.04), ["lift"] = (0.08, 0.14), ["compile"] = (0.22, 0.68), ["finish"] = (0.90, 0.02),
+        [ShaderStep.Id] = (0.92, 0.08),   // (hookshot --prepare-shaders: minutes on some GPUs, the first start's wait moved here)
+    };
+    static readonly Dictionary<string, (double From, double Size)> WithoutShaders = new()
     {
         ["download"] = (0, 0.04), ["read"] = (0.04, 0.04), ["lift"] = (0.08, 0.14), ["compile"] = (0.22, 0.74), ["finish"] = (0.96, 0.04),
     };
+    Dictionary<string, (double From, double Size)> Weight = WithoutShaders;
+    // (this build prepares the shaders: the tick for a build, the saved choice for an update. The game's @@stage shaders came, and
+    // make_game's line when it left them to the first start: the row's end says which)
+    bool prepareNow, shadersBegan;
+    string? shadersLater;
+    TimeSpan? builtIn;   // (at @@times: the build without the shaders' minutes, as build_times.json keeps it)
 
-    void MakeRows(bool update)
+    void MakeRows(bool update, bool shaders)
     {
         StageList.Children.Clear();
         rows.Clear();
-        var list = Stages.Where(s => update || s.Id != "download").ToList();
+        Weight = shaders ? WithShaders : WithoutShaders;
+        var list = Stages.Where(s => (update || s.Id != "download") && (shaders || s.Id != ShaderStep.Id)).ToList();
         for (var i = 0; i < list.Count; i++)
         {
             var row = new StepRow(i + 1, update ? list[i].Update : list[i].Build, last: i == list.Count - 1);
@@ -752,7 +759,7 @@ public partial class MainWindow : Window
         if (!keepRows)
         {
             updating = false;
-            MakeRows(update: false);
+            MakeRows(update: false, shaders: prepareNow);
             SetStep(1);
             BuildTitle.Text = "Building your game";
             UpdateBar.Visibility = Visibility.Collapsed;
@@ -769,6 +776,9 @@ public partial class MainWindow : Window
         compileEta = -1;
         thisCompile = 0;
         previousTotal = -1;
+        shadersBegan = false;
+        shadersLater = null;
+        builtIn = null;
         ShowPage(BuildPage);
         CancelButton.Visibility = Visibility.Visible;
         SetProgress(updating ? Weight["read"].From : 0);
@@ -795,6 +805,7 @@ public partial class MainWindow : Window
             current = id;
             if (rows.TryGetValue(id, out var row)) row.Begin();
             if (id == "compile") compileClock.Restart();
+            if (id == ShaderStep.Id) shadersBegan = true;
             if (Weight.TryGetValue(id, out var w)) SetProgress(w.From);
         }
         else if (line.StartsWith("@@progress "))
@@ -813,6 +824,7 @@ public partial class MainWindow : Window
             return;
         }
         else if (line.StartsWith("@@done ")) finished = line[7..];
+        else if (ShaderStep.Reason(line) is { } later) shadersLater = later;
         else if (FilesLine.Match(line) is { Success: true } m) filesOf = int.Parse(m.Groups[1].Value);
         else if (FileLine.IsMatch(line)) filesDone++;
         if (current == "compile" && filesChanged < 0 && filesOf > 0 && rows.TryGetValue("compile", out var c))
@@ -843,6 +855,7 @@ public partial class MainWindow : Window
                 compileEta = eta;
                 break;
             case "@@times" when p.Length == 4:
+                builtIn = elapsed.Elapsed;
                 long.TryParse(p[2], out thisCompile);
                 long.TryParse(p[3], out previousTotal);
                 break;
@@ -916,7 +929,12 @@ public partial class MainWindow : Window
         runner = null;
         if (finished.Length > 0)
         {
-            foreach (var r in rows.Values) r.Done();
+            foreach (var (id, r) in rows)
+            {
+                if (id != ShaderStep.Id) r.Done();
+                else if (ShaderStep.Skipped(shadersBegan, shadersLater) is { } why) { r.Skipped(); r.Small(why); }
+                else r.Done();
+            }
             SetProgress(1);
             ShowReady();
             return;
@@ -957,7 +975,7 @@ public partial class MainWindow : Window
         SetStep(2);
         ReadyTitle.Text = updating ? "Your game is updated" : "Your game is ready";
         var compiledNote = thisCompile > 0 ? $" (compiled in {Span(TimeSpan.FromSeconds(thisCompile))})" : "";
-        ReadyNote.Text = $"{(updating ? "Updated" : "Built")} in {Span(elapsed.Elapsed)}{compiledNote}{Against(elapsed.Elapsed)} · {finished}";
+        ReadyNote.Text = $"{(updating ? "Updated" : "Built")} in {Span(elapsed.Elapsed)}{compiledNote}{Against(builtIn ?? elapsed.Elapsed)} · {finished}";
         if (!updating && Environment.GetEnvironmentVariable("HOOKSHOT_UI_PREVIEW") == null)
             Finder.Shortcuts(finished, DesktopTick.IsChecked == true, StartTick.IsChecked == true);
         else if (updating && Environment.GetEnvironmentVariable("HOOKSHOT_UI_PREVIEW") == null)
@@ -1132,7 +1150,8 @@ public partial class MainWindow : Window
         StepPill.Visibility = Visibility.Collapsed;
         VersionChip.Visibility = Visibility.Visible;
         VersionChipText.Text = from != null && from != to ? $"{from} → {to}" : to;
-        MakeRows(update: true);
+        prepareNow = BuilderSettings.PrepareNow(SettingsPath);
+        MakeRows(update: true, shaders: prepareNow);
         BuildTitle.Text = "Updating your game";
         BuildNote.Text = "Getting the update…";
         RingBox.Visibility = Visibility.Collapsed;
@@ -1173,7 +1192,9 @@ public partial class MainWindow : Window
         // (a folder built with NVIDIA DLSS, its license accepted then, is built with it again)
         var dlss = File.Exists(System.IO.Path.Combine(folder, "ngx", "nvngx_dlss.dll")) &&
                    File.Exists(System.IO.Path.Combine(Storage.NgxSdk, "LICENSE.txt"));
-        Run(tools, new List<string> { "--update", folder }, keepRows: true, dlss: dlss);
+        // (prepareNow: the saved choice, read in BeginUpdate. The launcher's Update and the --update start after a self-update never
+        // ran ApplySettings, so the tick there is only its default)
+        Run(tools, ShaderStep.Args(new List<string> { "--update", folder }, prepareNow), keepRows: true, dlss: dlss);
     }
 
     // ================= the window =================
@@ -1285,6 +1306,24 @@ sealed class StepRow
         tick.Visibility = Visibility.Visible;
         name.Foreground = B("Ink");
         name.FontWeight = FontWeights.SemiBold;
+        time.Foreground = B("InkFaint");
+    }
+
+    /// (not done: left to later, the shaders' step when they were not prepared now)
+    public void Skipped()
+    {
+        if (running) Tick();
+        running = false;
+        watch.Stop();
+        disc.Fill = Brushes.Transparent;
+        disc.Stroke = B("GlassLineStrong");
+        disc.StrokeThickness = 1.5;
+        halo.Fill = Brushes.Transparent;
+        number.Text = "–";
+        number.Foreground = B("InkFaint");
+        tick.Visibility = Visibility.Collapsed;
+        name.Foreground = B("InkFaint");
+        name.FontWeight = FontWeights.Medium;
         time.Foreground = B("InkFaint");
     }
 

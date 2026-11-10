@@ -1,0 +1,22 @@
+namespace HookshotBuilder;
+
+/// What the player chose last time (the install folder, the game files, the shaders' tick): builder-settings.json beside the versions
+sealed class BuilderSettings
+{
+    public string? Out { get; set; }
+    public string? Nup { get; set; }
+    public string? Romfs { get; set; }
+    public string? Exefs { get; set; }
+    public bool Dlss { get; set; }   // (NVIDIA DLSS ticked: NVIDIA's license was accepted)
+    public bool PrepareLater { get; set; }   // ("Prepare shaders now" unticked)
+
+    public static BuilderSettings? Load(string path)
+    {
+        try { return System.Text.Json.JsonSerializer.Deserialize<BuilderSettings>(System.IO.File.ReadAllText(path)); }
+        catch (Exception) { return null; }
+    }
+
+    /// (the updates, from the launcher's Update and from the --update start after a self-update, begin before ApplySettings sets
+    /// the tick from these settings: they read the saved choice itself. None saved: prepared, as the tick's default)
+    public static bool PrepareNow(string path) => Load(path)?.PrepareLater != true;
+}

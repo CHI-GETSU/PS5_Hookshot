@@ -42,7 +42,7 @@ class BuildHarness:
         exefs.mkdir(exist_ok=True)
         self.gui = SimpleNamespace(
             out=value(str(folder / "out")), kind=value(kind), nup=value(str(nup)),
-            romfs=value(str(romfs)), exefs=value(str(exefs)), language=value("English (US)"),
+            romfs=value(str(romfs)), exefs=value(str(exefs)), language=value("English (US)"), prepare=value(True),
             cfg={"previous": "kept"}, show_progress=lambda: self.events.append(("progress",)), read=lambda proc: None)
 
         def start_process(command, **kwargs):
@@ -90,7 +90,8 @@ class BuilderBuildJobsTests(unittest.TestCase):
         self.assertEqual(options, dict(cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
                                        encoding="utf-8", errors="replace", start_new_session=True))
         self.assertEqual(harness.events[0][1], dict(previous="kept", kind=gui.kind.get(), nup=gui.nup.get(),
-                                                  romfs=gui.romfs.get(), exefs=gui.exefs.get(), out=gui.out.get(), language="en-US"))
+                                                  romfs=gui.romfs.get(), exefs=gui.exefs.get(), out=gui.out.get(), language="en-US",
+                                                  prepare="1"))
         self.assertEqual(harness.events[3][1], dict(target=gui.read, args=(gui.proc,), daemon=True))
 
     def test_positive_hookshot_jobs_is_passed_on(self):
@@ -98,6 +99,14 @@ class BuilderBuildJobsTests(unittest.TestCase):
         harness.run()
         self.assert_started(harness, 4)
         self.assertEqual(harness.environ, {"HOOKSHOT_JOBS": "4", "RX_JOBS": "2"})
+
+    def test_unticked_prepare_leaves_the_shaders_to_the_first_start(self):
+        harness = BuildHarness(self.folder, {})
+        harness.gui.prepare = value(False)
+        harness.run()
+        command, _ = harness.processes[0]
+        self.assertEqual(command[-1], "--no-prepare-shaders")
+        self.assertEqual(harness.events[0][1]["prepare"], "0")
 
     def test_zero_falls_back_to_rx_jobs_for_extracted_folders(self):
         harness = BuildHarness(self.folder, {"HOOKSHOT_JOBS": "0", "RX_JOBS": "2"}, kind="folders")

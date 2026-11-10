@@ -17,6 +17,9 @@ data ever comes with the tools. Lines the app reads, each on its own line of std
     @@check <ok|bad> <text>  (--check) the answer
     @@done <folder>          finished
     @@error <text>           stopped
+
+and one plain line the builders also read (older ones only show it): "the shaders were not prepared now (<why>): ..." when the
+build's last step, the shaders' preparation, was skipped or failed and is left to the game's first start (NOT_PREPARED)
 """
 import argparse
 import contextlib
@@ -24,10 +27,12 @@ import filecmp
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import stat
 import subprocess
+import threading
 import time
 import sys
 import tempfile
@@ -214,19 +219,65 @@ def clock(seconds):
     return "%d:%02d:%02d" % (s // 3600, s // 60 % 60, s % 60)
 
 
-def run(cmd, env=None, on_line=None, check=True, output=None):
-    e = dict(os.environ, PYTHONIOENCODING="utf-8")
+class Silent(Exception):
+    """a step printed nothing for longer than run()'s silence"""
+
+
+def output_lines(p, silence):
+    """A step's lines as they come; with silence (seconds), read on a thread so that a step which goes quiet that long (a hung
+    driver, a crash dialog left open) raises Silent instead of waiting for ever"""
+    if silence is None:
+        yield from p.stdout
+        return
+    lines = queue.Queue()
+
+    def read():
+        try:
+            for line in p.stdout:
+                lines.put(line)
+        except (OSError, ValueError):
+            pass
+        finally:
+            with contextlib.suppress(OSError, ValueError):
+                p.stdout.close()   # (here, not by run(): a stopped step's pipe may still be read by this thread)
+            lines.put(None)
+
+    threading.Thread(target=read, daemon=True).start()
+    while True:
+        try:
+            line = lines.get(timeout=silence)
+        except queue.Empty:
+            raise Silent() from None
+        if line is None:
+            return
+        yield line
+
+
+def run(cmd, env=None, on_line=None, check=True, output=None, show=None, cwd=ROOT, base=None, silence=None):
+    """A step, its output printed as it comes. show: what of each line is printed (its None: nothing; on_line and a failure's
+    reason still get the line itself). base: the environment it starts from (os.environ). silence: seconds without a line after
+    which the step is stopped; it returns None then (with check, the build fails)"""
+    e = dict(os.environ if base is None else base, PYTHONIOENCODING="utf-8")
     e.update(env or {})
-    p = subprocess.Popen(cmd, cwd=ROOT, env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+    p = subprocess.Popen(cmd, cwd=cwd, env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                          errors="replace", bufsize=1)
     no_throttle(getattr(p, "_handle", None))
     lines = []
-    for line in p.stdout:
-        line = line.rstrip()
-        print(line, file=output, flush=True)
-        lines.append(line)
-        if on_line:
-            on_line(line)
+    try:
+        for line in output_lines(p, silence):
+            line = line.rstrip()
+            shown = show(line) if show else line
+            if shown is not None:
+                print(shown, file=output, flush=True)
+            lines.append(line)
+            if on_line:
+                on_line(line)
+    except Silent:
+        p.kill()
+        p.wait()
+        if check:
+            fail("%s printed nothing for %s and was stopped" % (os.path.basename(cmd[0]), span(silence)))
+        return None
     p.stdout.close()
     code = p.wait()
     if code and check:
@@ -772,6 +823,69 @@ def ship_state_list(out):
     print("the shipped pipeline state list: %d pipelines" % ((os.path.getsize(src) - 12) // 528), flush=True)
 
 
+# (the builders read this line's start: the step was skipped or failed, and the shaders' row says so instead of a check mark)
+NOT_PREPARED = "the shaders were not prepared now"
+# (a run that prints nothing this long is stopped. Not its whole length: that is 25 minutes on some AMD GPUs, and the driver's own
+# step near the end can sit at 99% for minutes)
+PREPARE_SILENCE = 15 * 60
+GAME_ENV_DROP = ("HOOKSHOT_", "PYTHON", "APPDIR", "APPIMAGE", "ARGV0", "OWD")
+
+
+def span(seconds):
+    return "%d minutes" % (seconds // 60) if seconds >= 120 else "%g seconds" % seconds
+
+
+def game_env(environ=None):
+    """The environment the game runs in when the tools start it: without what the AppImage runtime and the tools put there (their
+    libraries first on the search path, Python's settings, the HOOKSHOT_ build switches), so it loads its own SDL and the system's
+    Vulkan, as when the player starts it. The Linux builder's Play button uses it too; builder/linux/hookshot-launch drops the same"""
+    env = {k: v for k, v in (os.environ if environ is None else environ).items() if not k.startswith(GAME_ENV_DROP)}
+    env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
+def not_prepared(why):
+    print("%s (%s): the game prepares them at its first start" % (NOT_PREPARED, why), flush=True)
+
+
+def prepare_skipped(a, environ=None):
+    """Why the build leaves the shaders to the first start, or None: it prepares them"""
+    environ = os.environ if environ is None else environ
+    if a.no_prepare_shaders:
+        return '"Prepare shaders now" is unticked'
+    if environ.get("HOOKSHOT_NO_PREPARE", "0") != "0":   # (set and not 0, as the game reads HOOKSHOT_NO_UPDATE_CHECK)
+        return "HOOKSHOT_NO_PREPARE is set"
+    if CROSS:   # (hookshot.exe can't run here, and under Wine it would prepare for this PC's GPU, not the one that plays it)
+        return "a Windows game built on Linux prepares them on the PC it runs on"
+    return None
+
+
+def show_prepared(line):
+    """The game's @@stage and @@progress lines go on to the builder; its own @@done and @@error would end or fail the build there,
+    so they go on as plain text"""
+    return line if line.startswith(("@@stage ", "@@progress ")) or not line.startswith("@@") else line[2:]
+
+
+def prepare_shaders(cmd, folder=None, silence=PREPARE_SILENCE):
+    """The shaders prepared now, under the builder's progress bar, not at the game's first start behind a black window (minutes on
+    some GPUs, issue 711): hookshot --prepare-shaders (host/hos_main.c, gpu/vk/vk_main.cpp), the same work as that first start, in
+    the game's folder and environment, as the builders' Play starts it. A PC whose Vulkan can't (exit 3), a run silent for `silence` seconds (then stopped), or
+    any other failure leaves the work to the first start, as before: never a failed build. Returns its exit code (None: stopped)"""
+    try:
+        code = run(cmd, check=False, show=show_prepared, cwd=folder or os.path.dirname(cmd[0]) or None,
+                   base=game_env(), silence=silence)
+    except OSError as e:
+        not_prepared(str(e))
+        return 1
+    if code is None:
+        not_prepared("the game printed nothing for %s and was stopped" % span(silence))
+    elif code == 3:
+        not_prepared("no usable Vulkan here")
+    elif code:
+        not_prepared("the game stopped with exit status %d" % code)
+    return code
+
+
 def folder_language(out):
     """the language a game folder was built in: the code line of its language.txt"""
     try:
@@ -962,6 +1076,8 @@ def parse_args():
     p.add_argument("--language", default="en-US", help="the game's language: a code from LANGUAGES, written to language.txt")
     p.add_argument("--check", action="store_true")
     p.add_argument("--update", help="a game folder built before: built again from the game files it keeps (the game's update offer)")
+    p.add_argument("--no-prepare-shaders", action="store_true",
+                   help="leave the shaders' preparation to the game's first start (the builder's \"Prepare shaders now\" unticked)")
     p.add_argument("--log", metavar="FILE", help="also save build output to a UTF-8 file (replaces the file if it exists)")
     # (NVIDIA DLSS, off unless asked: NVIDIA's SDK into HOOKSHOT_NGX_SDK first, under NVIDIA's license. scripts/ngx_sdk.py)
     p.add_argument("--fetch-ngx-sdk", action="store_true", help="download NVIDIA's DLSS SDK into HOOKSHOT_NGX_SDK before the build")
@@ -1279,6 +1395,12 @@ def main(a=None):
     print("the build took %s, compiled in %s%s" % (clock(total_seconds), clock(compile_seconds),
                                                     "" if previous is None else " (the last one %s)" % clock(previous)), flush=True)
     say("times", "%.0f" % total_seconds, "%.0f" % compile_seconds, "-1" if previous is None else "%.0f" % previous)
+    # (after the times: they stay comparable from build to build, without a GPU's minutes that can be switched off)
+    skipped = prepare_skipped(a)
+    if skipped:
+        not_prepared(skipped)
+    else:
+        prepare_shaders([os.path.join(game_dir, BESIDE[0]), "--prepare-shaders"], out)
     say("done", out)
 
 
