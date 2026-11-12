@@ -1,0 +1,144 @@
+--- /dev/null
++++ b/gpu/vk/ps5_switches.h
+@@ -0,0 +1,77 @@
++/* PS5: (2026-11-10) the decisions behind three boot.ini switches, kept apart so a PC test can check them in both
++ * positions (a PC unit test). Every switch's absent or 0 value is the behaviour before these patches. */
++#pragma once
++#include <cstdint>
++#include <cstdlib>
++#include <algorithm>
++#include <tuple>
++#include <utility>
++#include <vector>
++
++/* RX_VK_RETIRED_GIVE_BACK=1: a retired pool's import is given back once the GPU is past it (Hookshot f2203e4, which had it
++   on by default with RX_VK_KEEP_RETIRED=1 to keep). Absent or 0: kept, as before. */
++inline bool ps5_retired_give_back(const char* e) { return e && atoi(e) != 0; }
++
++/* RX_VK_IMAGE_BLOCK_MB=<n>: the image pool's block size, 8 to 512 MB. Absent, 0 or out of range: 128, as before. */
++inline uint64_t ps5_image_block_bytes(const char* e) {
++    const int mb = e ? atoi(e) : 0;
++    return (uint64_t)(mb >= 8 && mb <= 512 ? mb : 128) << 20;
++}
++
++/* RX_VK_TEX_TRIM_MB=<n>: a compressed (BC or ASTC), non-depth, single-sample texture with mip levels whose bytes from its
++   current top level are over n MB leaves out top levels until it is not (the mechanism RX_VK_TEX_MAX_MB already uses for
++   huge ones; one level at least is kept). Absent or 0: nothing more left out, as before. bytes_from(skip) is the texture's
++   size from level skip down. Returns the new skip. */
++template <typename BytesFrom>
++inline uint32_t ps5_tex_trim_skip(const char* e, bool eligible, uint32_t skip, uint32_t levels, BytesFrom&& bytes_from) {
++    const uint64_t trim = (uint64_t)(e ? std::max(0, atoi(e)) : 0) << 20;
++    if (!trim || !eligible) return skip;
++    while (skip + 1 < levels && bytes_from(skip) > trim) skip++;
++    return skip;
++}
++
++/* PS5: (2026-11-11) RX_VK_IMAGE_DEDICATED_MB=<n>, 1 to 1024: an image whose memory requirement is n MB or more
++   gets a VkDeviceMemory of its own (VMA dedicated), outside the image pool, so destroying it gives its direct memory back
++   at once instead of leaving a hole in a pool block. Absent, 0 or out of range: 0, every image as before. */
++inline uint64_t ps5_image_dedicated_bytes(const char* e) {
++    const int mb = e ? atoi(e) : 0;
++    return mb >= 1 && mb <= 1024 ? (uint64_t)mb << 20 : 0;
++}
++inline bool ps5_image_goes_dedicated(uint64_t threshold, uint64_t size) { return threshold && size >= threshold; }
++
++/* PS5: (2026-11-11) RX_VK_EVICT_KEEP_RENDERED=1: the cache never evicts a texture whose texels exist only in its
++   image: written by the GPU, not finalized by the game since, and not drawn over by another image. Such a texture made
++   again reads its storage, which the GPU rendered and the CPU never wrote: it came back empty (test forêt 3, #1400
++   260x260 NVN 0xd "made again 17 frames after its eviction, sampled EMPTY"). Absent or 0: as before (the age rule). */
++inline bool ps5_keep_rendered(const char* e) { return e && atoi(e) != 0; }
++inline bool ps5_rendered_protected(bool on, bool gpu_written, bool released, bool overwritten) {
++    return on && gpu_written && !released && !overwritten;
++}
++
++/* PS5: (measure) a texture the game finalized and has not used since: what freeing finalized textures could
++   give. finalized_frame 0: never finalized. */
++inline bool ps5_finalize_candidate(uint64_t finalized_frame, uint64_t last_frame) {
++    return finalized_frame && last_frame <= finalized_frame;
++}
++/* The memory blocks the candidates would empty: per block (its id), the bytes of all live textures in it and of the
++   candidates. A block wholly of candidates would be given back whole. */
++struct Ps5BlockTally { uint64_t blocks = 0, whole = 0, whole_bytes = 0, cand_bytes = 0, cand_n = 0; };
++template <typename It>   /* It: (block id, bytes, candidate) */
++inline Ps5BlockTally ps5_block_tally(It first, It last) {
++    struct B { uint64_t all = 0, cand = 0; };
++    std::vector<std::pair<uint64_t, B>> v;
++    for (It i = first; i != last; ++i) {
++        const auto& [id, bytes, cand] = *i;
++        auto f = std::find_if(v.begin(), v.end(), [&](const auto& p) { return p.first == id; });
++        if (f == v.end()) { v.push_back({id, {}}); f = v.end() - 1; }
++        f->second.all += bytes;
++        if (cand) f->second.cand += bytes;
++    }
++    Ps5BlockTally t;
++    for (It i = first; i != last; ++i) if (std::get<2>(*i)) t.cand_bytes += std::get<1>(*i), t.cand_n++;
++    for (const auto& [id, b] : v) {
++        t.blocks++;
++        if (b.cand && b.cand == b.all) t.whole++, t.whole_bytes += b.all;
++    }
++    return t;
++}
+--- a/gpu/vk/vk_texture.cpp
++++ b/gpu/vk/vk_texture.cpp
+@@ -10,6 +10,7 @@
+ // RGBA8, is one image. A class is the bytes per block for uncompressed colour, the format family for BC and ASTC,
+ // the format itself for depth / stencil.
+ #include <algorithm>
++#include "ps5_switches.h"   /* PS5 port switches */
+ #define WIN32_LEAN_AND_MEAN
+ #ifndef NOMINMAX
+ #define NOMINMAX
+@@ -1333,6 +1359,22 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
+                (std::max(x.width, x.height) >> x.skip) > max_dim)
+             x.skip++;
+         while (!x.sparse && x.skip + 1 < x.levels && bytes_at(x.skip) > max_bytes) x.skip++;
++        {   /* PS5: RX_VK_TEX_TRIM_MB=<n>: compressed textures over n MB leave out their top level(s) too, by the
++               mechanism above (ps5_switches.h). Absent or 0: as before. Not depth, not multisampled, not sparse; BC or ASTC
++               only (uncompressed maps may be rendered into or read at exact texels, where a level left out is wrong) */
++            static const char* trim_env = getenv("RX_VK_TEX_TRIM_MB");
++            const bool eligible = !x.sparse && !depth && d.samples <= 1 && (astc || is_bc(x.format));
++            const uint32_t before = x.skip;
++            x.skip = ps5_tex_trim_skip(trim_env, eligible, x.skip, x.levels, bytes_at);
++            if (x.skip != before) {
++                static std::atomic<uint64_t> trimmed{0}, saved{0};
++                const uint64_t n = ++trimmed, s = saved += bytes_at(before) - bytes_at(x.skip);
++                logf("vk: tex trim #%llu: texture %#llx %ux%ux%u x%u (NVN %#x): %u level(s) left out, %llu -> %llu MB (in all %llu MB saved)",
++                     (unsigned long long)n, (unsigned long long)t->gpu, x.width, x.height, x.depth, x.layers, d.format,
++                     x.skip - before, (unsigned long long)(bytes_at(before) >> 20), (unsigned long long)(bytes_at(x.skip) >> 20),
++                     (unsigned long long)(s >> 20));
++            }
++        }
+         if (x.skip) {
+             static int logged;
+             if (logged++ < 40)
+--- a/gpu/vk/vk_vma.cpp
++++ b/gpu/vk/vk_vma.cpp
+@@ -5,8 +5,10 @@
+ #define VMA_STATIC_VULKAN_FUNCTIONS 0
+ #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
+ #include "vk_internal.h"
++#include "ps5_switches.h"   /* PS5 port switches */
+ #include <vk_mem_alloc.h>
+ #include <algorithm>
++#include <atomic>
+ #include <cstdlib>
+ 
+ namespace mkwvk {
+@@ -35,7 +37,8 @@ bool vma_init(PFN_vkGetInstanceProcAddr gipa) {
+ // memory type the pool's is not, are allocated as before.
+ VmaPool image_pool = VK_NULL_HANDLE;
+ bool image_pool_tried = false;
+-constexpr uint64_t kImageBlock = 128ull << 20;
++/* PS5: RX_VK_IMAGE_BLOCK_MB, 8 to 512, absent: 128 as before (ps5_switches.h). Read once, at the pool's making */
++uint64_t kImageBlock = 128ull << 20;
+ 
+ VmaPool images_pool() {
+     if (image_pool_tried) return image_pool;
+@@ -52,6 +55,7 @@ VmaPool images_pool() {
+     ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+     uint32_t type = 0;
+     if (vmaFindMemoryTypeIndexForImageInfo(vma, &rep, &ai, &type) != VK_SUCCESS) return VK_NULL_HANDLE;
++    kImageBlock = ps5_image_block_bytes(getenv("RX_VK_IMAGE_BLOCK_MB"));   /* PS5 port */
+     VmaPoolCreateInfo pi{};
+     pi.memoryTypeIndex = type;
+     pi.blockSize = kImageBlock;

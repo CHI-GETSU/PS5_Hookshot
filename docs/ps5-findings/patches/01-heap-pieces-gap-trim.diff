@@ -1,0 +1,279 @@
+--- a/platform/src/heap.c
++++ b/platform/src/heap.c
+@@ -43,7 +43,9 @@
+ void mspace_free(mspace space, void *pointer);
+ 
+ 
+-#define HEAP_MAX_SEGMENTS 1024
++/* PS5 port (heap pieces): each piece is a segment of its own, so the table holds the whole 16 GiB range in
++ * 2 MiB pieces (8192); it was 1024. */
++#define HEAP_MAX_SEGMENTS 8192
+ #define HEAP_UNIT PS5P_DIRECT_UNIT
+ #define HEAP_PROTECTION (PS5_KERNEL_PROT_CPU_READ | PS5_KERNEL_PROT_CPU_WRITE)
+ 
+@@ -59,6 +61,28 @@
+ static size_t mapped_bytes, peak_bytes;
+ static unsigned long long libc_fallbacks;
+ 
++/* PS5 port (heap pieces): the direct memory under a segment is taken in pieces of heap_piece_bytes, each
++ * allocated and mapped on its own at the next address, instead of one physically contiguous block of the segment's
++ * size: the CPU needs the addresses to follow each other, not the memory. A pool cut into small free ranges then still
++ * gives the heap what it has in all (measured on console, 2026-11-10: 183 MiB free, largest block 53 MiB, the heap
++ * refused, operator new failed). 0: one block, as before. Set once at start (ps5p_heap_set_piece, from boot.ini's
++ * HOS_HEAP_PIECE_MB), read under segment_lock. A refusal is recorded for the title's report (ps5p_heap_refusal). */
++static size_t heap_piece_bytes = (size_t)2 << 20;
++
++/* PS5 port (heap gap): HOS_HEAP_GAP=1 leaves one unit (64 KiB of address space, no direct memory) free
++ * after every segment. dlmalloc joins a segment it maps right after another into one (sys_alloc), and returns a segment
++ * only when the whole of it is free (release_unused_segments) or its top through a partial unmap that
++ * heap_unmap_locked refuses: with the segments placed end to end the heap never gave anything back (PC test
++ * PC test test_heap_gap.c; measured on console, 2026-11-11: the mapped heap only grows). Set once at start (ps5p_heap_set_gap), read
++ * under segment_lock.
++ * HOS_HEAP_COUNT=1 (measure): the bytes in use (usable sizes), in heap_in_use (relaxed atomic); blocks made before the
++ * switch are not counted, so the figure can sit slightly low. */
++static size_t heap_gap_bytes;
++static bool heap_count;
++static long long heap_in_use;
++static unsigned long long refusals;
++static size_t refused_bytes, refused_got;
++
+ static uintptr_t range_base;
+ static size_t range_bytes;
+ 
+@@ -98,34 +122,82 @@
+    unsigned slot = 0;
+    size_t offset = 0;
+    for (; slot < segment_count; slot++) {
+-      if (segments[slot].offset - offset >= bytes)
++      if (segments[slot].offset >= offset && segments[slot].offset - offset >= bytes + heap_gap_bytes)
+          break;
+-      offset = segments[slot].offset + segments[slot].bytes;
++      offset = segments[slot].offset + segments[slot].bytes + heap_gap_bytes;   /* PS5 port (0 without it) */
+    }
+    if (offset > range_bytes || range_bytes - offset < bytes)
+       return (void *)-1;
+ 
+-   int64_t start = -1;
+-   if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), bytes, HEAP_UNIT,
+-                                     PS5_KERNEL_DIRECT_TYPE_CPU, &start) != 0)
++   if (heap_piece_bytes == 0 || bytes <= heap_piece_bytes) {
++      int64_t start = -1;
++      if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), bytes, HEAP_UNIT,
++                                        PS5_KERNEL_DIRECT_TYPE_CPU, &start) != 0) {
++         refusals++, refused_bytes = bytes, refused_got = 0;
++         return (void *)-1;
++      }
++      void *const at = (void *)(range_base + offset);
++      void *mapped = at;
++      if (sceKernelMapDirectMemory(&mapped, bytes, HEAP_PROTECTION, PS5_KERNEL_MAP_FIXED, start,
++                                   HEAP_UNIT) != 0 ||
++          mapped != at) {
++         sceKernelReleaseDirectMemory(start, bytes);
++         refusals++, refused_bytes = bytes, refused_got = 0;
++         return (void *)-1;
++      }
++      memmove(&segments[slot + 1], &segments[slot],
++              (segment_count - slot) * sizeof(segments[0]));
++      segments[slot] = (struct heap_segment){.offset = offset, .bytes = bytes, .direct_start = start};
++      segment_count++;
++      mapped_bytes += bytes;
++      if (mapped_bytes > peak_bytes)
++         peak_bytes = mapped_bytes;
++      return at;
++   }
++
++   /* (pieces) all of them or none: the ones taken are given back on a refusal. They go into the table at slot, slot+1,
++    * ... in address order, so the table stays sorted and heap_unmap_locked frees any span of them as it is. */
++   const unsigned pieces = (unsigned)((bytes + heap_piece_bytes - 1) / heap_piece_bytes);
++   if (pieces > HEAP_MAX_SEGMENTS - segment_count) {
++      refusals++, refused_bytes = bytes, refused_got = 0;
+       return (void *)-1;
+-   void *const at = (void *)(range_base + offset);
+-   void *mapped = at;
+-   if (sceKernelMapDirectMemory(&mapped, bytes, HEAP_PROTECTION, PS5_KERNEL_MAP_FIXED, start,
+-                                HEAP_UNIT) != 0 ||
+-       mapped != at) {
+-      sceKernelReleaseDirectMemory(start, bytes);
++   }
++   memmove(&segments[slot + pieces], &segments[slot], (segment_count - slot) * sizeof(segments[0]));
++   size_t done = 0;
++   unsigned made = 0;
++   while (done < bytes) {
++      const size_t piece = bytes - done < heap_piece_bytes ? bytes - done : heap_piece_bytes;
++      int64_t start = -1;
++      void *const at = (void *)(range_base + offset + done);
++      void *mapped = at;
++      if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), piece, HEAP_UNIT,
++                                        PS5_KERNEL_DIRECT_TYPE_CPU, &start) != 0)
++         break;
++      if (sceKernelMapDirectMemory(&mapped, piece, HEAP_PROTECTION, PS5_KERNEL_MAP_FIXED, start, HEAP_UNIT) != 0 ||
++          mapped != at) {
++         sceKernelReleaseDirectMemory(start, piece);
++         break;
++      }
++      segments[slot + made] = (struct heap_segment){.offset = offset + done, .bytes = piece, .direct_start = start};
++      made++;
++      done += piece;
++   }
++   if (done < bytes) {   /* (refused: the pieces made go back, the range is reserved again under them) */
++      for (unsigned i = 0; i < made; i++) {
++         void *at = (void *)(range_base + segments[slot + i].offset);
++         sceKernelMunmap(at, segments[slot + i].bytes);
++         sceKernelReserveVirtualRange(&at, segments[slot + i].bytes, PS5_KERNEL_MAP_FIXED, PS5P_PAGE);
++         sceKernelReleaseDirectMemory(segments[slot + i].direct_start, segments[slot + i].bytes);
++      }
++      memmove(&segments[slot], &segments[slot + pieces], (segment_count - slot) * sizeof(segments[0]));
++      refusals++, refused_bytes = bytes, refused_got = done;
+       return (void *)-1;
+    }
+-
+-   memmove(&segments[slot + 1], &segments[slot],
+-           (segment_count - slot) * sizeof(segments[0]));
+-   segments[slot] = (struct heap_segment){.offset = offset, .bytes = bytes, .direct_start = start};
+-   segment_count++;
++   segment_count += pieces;
+    mapped_bytes += bytes;
+    if (mapped_bytes > peak_bytes)
+       peak_bytes = mapped_bytes;
+-   return at;
++   return (void *)(range_base + offset);
+ }
+ 
+ void *
+@@ -270,6 +342,77 @@
+    stats->libc_fallbacks = __atomic_load_n(&libc_fallbacks, __ATOMIC_RELAXED);
+ }
+ 
++/* PS5 port (heap pieces): the piece size (0: one block per segment, as before), rounded to the heap's unit.
++ * Called once at start, before the threads that allocate; under the lock all the same. */
++void
++ps5p_heap_set_piece(size_t bytes)
++{
++   pthread_mutex_lock(&segment_lock);
++   heap_piece_bytes = bytes ? ps5p_round_up(bytes, HEAP_UNIT) : 0;
++   pthread_mutex_unlock(&segment_lock);
++}
++
++/* PS5 port (heap pieces): the piece size, the refusals so far and the last one (what was asked, what had been
++ * got). A report, read without the lock. */
++void
++ps5p_heap_refusal(size_t *piece, unsigned long long *count, size_t *asked, size_t *got)
++{
++   *piece = heap_piece_bytes;
++   *count = refusals;
++   *asked = refused_bytes;
++   *got = refused_got;
++}
++
++/* PS5 port (operator new wait): give back to the console what the arenas hold free at their tops (dlmalloc's
++ * mspace_trim, each arena under its own lock; the segments go back through ps5p_heap_unmap under segment_lock, the
++ * order every return already takes). Only arenas made so far. Returns the heap's mapped bytes before minus after
++ * (other threads' maps and returns in the meantime count too: a figure for the log, not a decision). Called by
++ * operator new while it waits and, with HOS_HEAP_GAP=1, by the title every 10 s. */
++int mspace_trim(mspace space, size_t pad);
++size_t
++ps5p_heap_trim(void)
++{
++   /* (mapped_bytes is written under segment_lock: read under it too; never held across mspace_trim, which takes it) */
++   pthread_mutex_lock(&segment_lock);
++   const size_t before = mapped_bytes;
++   pthread_mutex_unlock(&segment_lock);
++   for (unsigned i = 0; i < HEAP_ARENAS; i++)
++      if (__atomic_load_n(&arena_states[i], __ATOMIC_ACQUIRE) == 2)
++         mspace_trim(arenas[i], 0);
++   pthread_mutex_lock(&segment_lock);
++   const size_t after = mapped_bytes;
++   pthread_mutex_unlock(&segment_lock);
++   return before > after ? before - after : 0;   /* (other threads' maps and returns meanwhile count too: a figure) */
++}
++
++/* PS5 port (heap gap): the switches, called once at start before the threads that allocate. */
++void
++ps5p_heap_set_gap(bool on)
++{
++   pthread_mutex_lock(&segment_lock);
++   heap_gap_bytes = on ? HEAP_UNIT : 0;
++   pthread_mutex_unlock(&segment_lock);
++}
++
++void
++ps5p_heap_set_count(bool on)
++{
++   __atomic_store_n(&heap_count, on, __ATOMIC_RELAXED);
++}
++
++long long
++ps5p_heap_in_use(void)
++{
++   return __atomic_load_n(&heap_in_use, __ATOMIC_RELAXED);
++}
++
++static inline void
++count_block(const void *pointer, int sign)
++{
++   if (pointer && __atomic_load_n(&heap_count, __ATOMIC_RELAXED))
++      __atomic_fetch_add(&heap_in_use, sign * (long long)mspace_usable_size(pointer), __ATOMIC_RELAXED);
++}
++
+ void
+ ps5p_heap_count_fallback(void)
+ {
+@@ -278,38 +421,53 @@
+ 
+ /* ------------------------------------------------------------ the heap */
+ 
++/* (heap gap) count_block: HOS_HEAP_COUNT's measure, nothing when it is off */
+ void *
+ ps5_heap_malloc(size_t bytes)
+ {
+    const mspace space = title_heap();
+-   return space ? mspace_malloc(space, bytes) : NULL;
++   void *const p = space ? mspace_malloc(space, bytes) : NULL;
++   count_block(p, 1);
++   return p;
+ }
+ 
+ void *
+ ps5_heap_calloc(size_t count, size_t bytes)
+ {
+    const mspace space = title_heap();
+-   return space ? mspace_calloc(space, count, bytes) : NULL;
++   void *const p = space ? mspace_calloc(space, count, bytes) : NULL;
++   count_block(p, 1);
++   return p;
+ }
+ 
+ void *
+ ps5_heap_memalign(size_t alignment, size_t bytes)
+ {
+    const mspace space = title_heap();
+-   return space ? mspace_memalign(space, alignment, bytes) : NULL;
++   void *const p = space ? mspace_memalign(space, alignment, bytes) : NULL;
++   count_block(p, 1);
++   return p;
+ }
+ 
+ void *
+ ps5_heap_realloc(void *pointer, size_t bytes)
+ {
+-   return pointer ? mspace_realloc(any_arena(), pointer, bytes) : ps5_heap_malloc(bytes);
++   if (!pointer)
++      return ps5_heap_malloc(bytes);
++   const size_t old = __atomic_load_n(&heap_count, __ATOMIC_RELAXED) ? mspace_usable_size(pointer) : 0;
++   void *const p = mspace_realloc(any_arena(), pointer, bytes);
++   if (p && __atomic_load_n(&heap_count, __ATOMIC_RELAXED))   /* (a failed realloc leaves the old block as it was) */
++      __atomic_fetch_add(&heap_in_use, (long long)mspace_usable_size(p) - (long long)old, __ATOMIC_RELAXED);
++   return p;
+ }
+ 
+ void
+ ps5_heap_free(void *pointer)
+ {
+-   if (pointer)
++   if (pointer) {
++      count_block(pointer, -1);
+       mspace_free(any_arena(), pointer);
++   }
+ }
+ 
+ size_t
